@@ -68,6 +68,35 @@ class SFRHomePlatform {
   }
 
   _reconcile(devices) {
+    // --- Étape 1 : fusionner les devices "Battery" avec leur parent ---
+    const merged = [];
+    const byName = Object.create(null);
+
+    for (const d of devices) {
+      const name = (d.name || "").trim();
+      if (!name) continue;
+
+      if (name.endsWith(" Battery")) {
+        // Exemple : "Cuisine Battery" → parent "Cuisine"
+        const baseName = name.replace(/\s+Battery$/i, "").trim();
+        const parent = byName[baseName];
+        if (parent) {
+          // Fusion : on insère le niveau de batterie trouvé
+          parent.batteryLevel = d.sensorValues?.Battery?.value || d.batteryLevel || null;
+        } else {
+          // On garde en mémoire pour fusion ultérieure
+          byName[name] = d;
+        }
+      } else {
+        byName[name] = d;
+        merged.push(d);
+      }
+    }
+
+    // Si un device "Battery" restait orphelin (pas de parent), on l'ignore
+    devices = merged;
+
+    // --- Étape 2 : création/mise à jour Homebridge ---
     const seen = new Set();
     for (const d of devices) {
       const id = (d.id && String(d.id)) || (d.rrd_id && String(d.rrd_id)) || `${d.deviceType || "DEVICE"}-${d.name || "unknown"}`;
@@ -92,7 +121,7 @@ class SFRHomePlatform {
       this._updateValues(accessory, d);
     }
 
-    // Supprimer les accessoires disparus
+    // --- Étape 3 : suppression des accessoires disparus ---
     const toRemove = [];
     for (const [uuid, acc] of this.accessories.entries()) {
       if (!seen.has(uuid)) {
@@ -105,6 +134,7 @@ class SFRHomePlatform {
       toRemove.forEach((acc) => this.log.info(`- Accessoire supprimé: ${acc.displayName}`));
     }
   }
+
 
   _categoryFor(d) {
     const c = hap.Categories;
@@ -395,3 +425,4 @@ class SFRHomePlatform {
     }
   }
 }
+
