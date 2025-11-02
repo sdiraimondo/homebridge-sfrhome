@@ -1,6 +1,6 @@
 // homebridge-sfrhome / index.js
-// v0.3.1 — BatteryService + mapping ON/OFF + écriture optionnelle via API locale
-// Port configurable via controlPort dans config.json
+// v0.3.2 — Fusion "Battery" + parent, et écriture de caractéristiques seulement si supportées.
+// (Conserve tout le reste : BatteryService, mapping ON/OFF réel, écriture optionnelle via API locale, controlPort configurable)
 
 let hap;
 const PLUGIN_NAME = "homebridge-sfrhome";
@@ -67,38 +67,143 @@ class SFRHomePlatform {
     });
   }
 
-  _reconcile(devices) {
-    // --- Étape 1 : fusionner les devices "Battery" avec leur parent ---
-    const merged = [];
-    const byName = Object.create(null);
+  // -------- Helpers ----------
+  _categoryFor(d) {
+    const c = hap.Categories;
+    switch ((d.deviceType || "").toUpperCase()) {
+      case "ALARM_PANEL": return c.SECURITY_SYSTEM;
+      case "MAGNETIC": return c.SENSOR;
+      case "PIR_DETECTOR": return c.SENSOR;
+      case "SMOKE": return c.SENSOR;
+      case "TEMP_HUM": return c.SENSOR;
+      case "LED_BULB_DIMMER":
+      case "LED_BULB_HUE":
+      case "LED_BULB_COLOR":
+      case "ON_OFF_PLUG": return c.LIGHTBULB;
+      default: return c.OTHER;
+    }
+  }
 
-    for (const d of devices) {
-      const name = (d.name || "").trim();
-      if (!name) continue;
+  _maybeSet(svc, Char, value) {
+    // N’écrit la caractéristique que si le service la supporte (évite les warnings Homebridge)
+    try {
+      if (!svc || !Char) return;
+      if (typeof svc.testCharacteristic === "function" && !svc.testCharacteristic(Char)) {
+        return;
+      }
+      svc.updateCharacteristic(Char, value);
+    } catch (_) {}
+  }
 
-      if (name.endsWith(" Battery")) {
-        // Exemple : "Cuisine Battery" → parent "Cuisine"
-        const baseName = name.replace(/\s+Battery$/i, "").trim();
-        const parent = byName[baseName];
-        if (parent) {
-          // Fusion : on insère le niveau de batterie trouvé
-          parent.batteryLevel = d.sensorValues?.Battery?.value || d.batteryLevel || null;
-        } else {
-          // On garde en mémoire pour fusion ultérieure
-          byName[name] = d;
+  _extractBattery(d) {
+    // Retourne un pourcentage 0..100 ou null
+    const direct = parseInt(String(d.batteryLevel ?? ""), 10);
+    if (!isNaN(direct) && direct >= 0 && direct <= 100) return direct;
+
+    const sv = d.sensorValues || {};
+    for (const key of Object.keys(sv)) {
+      if (/battery/i.test(key)) {
+        const raw = String(sv[key].value || "");
+        const n = parseInt(raw.replace("%", "").trim(), 10);
+        if (!isNaN(n) && n >= 0 && n <= 100) return n;
+      }
+    }
+    return null;
+  }
+
+  _boolFromValue(v) {
+    if (typeof v === "boolean") return v;
+    const s = String(v).trim().toLowerCase();
+    return s === "1" || s === "on" || s === "true" || s === "yes";
+  }
+
+  _findOnOffInSensorValues(d) {
+    // Heuristique pour trouver un état On/Off dans sensorValues
+    const sv = d.sensorValues || {};
+    const candidates = ["state","power","on","switch","relay","onoff","status"];
+    for (const name of Object.keys(sv)) {
+      const low = name.toLowerCase();
+      if (candidates.includes(low)) {
+        const val = sv[name].value;
+        // gère ON/OFF/1/0/true/false
+        if (typeof val === "string" && /^(on|off|true|false|0|1)$/i.test(val.trim())) {
+          return this._boolFromValue(val);
         }
+        // sinon on tente parse bool
+        return this._boolFromValue(val);
+      }
+    }
+    return null;
+  }
+
+  _baseNameForBattery(name) {
+    if (!name) return { base: "", isBattery: false };
+    const trimmed = String(name).trim();
+    if (/ Battery$/i.test(trimmed)) {
+      return { base: trimmed.replace(/\s+Battery$/i, "").trim(), isBattery: true };
+    }
+    return { base: trimmed, isBattery: false };
+  }
+
+  _groupAndMergeDevices(devices) {
+    // Regroupe par "nom de base" : "Cuisine" et "Cuisine Battery" → groupe "Cuisine"
+    const groups = new Map();
+    for (const d of devices) {
+      const { base, isBattery } = this._baseNameForBattery(d.name || "");
+      const key = base || (d.name || "");
+      if (!groups.has(key)) groups.set(key, { main: null, battery: null, extras: [] });
+
+      const g = groups.get(key);
+      if (isBattery) {
+        g.battery = d;
       } else {
-        byName[name] = d;
-        merged.push(d);
+        // S’il y a plusieurs "main", on choisit le premier avec deviceType capteur/utile
+        if (!g.main) {
+          g.main = d;
+        } else {
+          g.extras.push(d); // on ne perd rien, mais on n’exposera pas ces doublons
+        }
       }
     }
 
-    // Si un device "Battery" restait orphelin (pas de parent), on l'ignore
-    devices = merged;
+    // Produit la liste des devices fusionnés
+    const merged = [];
+    for (const [key, g] of groups.entries()) {
+      let m = g.main || g.battery; // au pire, si on n’a QUE le battery (rare), on le garde
+      if (!m) continue;
 
-    // --- Étape 2 : création/mise à jour Homebridge ---
+      // Injecte un niveau de batterie si “Battery” existe
+      if (g.battery) {
+        const fromSV = g.battery.sensorValues?.Battery?.value;
+        const fromTop = g.battery.batteryLevel;
+        const extracted = (() => {
+          if (typeof fromSV === "string") {
+            const n = parseInt(fromSV.replace("%", "").trim(), 10);
+            if (!isNaN(n)) return n;
+          }
+          const n2 = parseInt(String(fromTop ?? ""), 10);
+          return !isNaN(n2) ? n2 : null;
+        })();
+
+        if (extracted !== null) {
+          m = { ...m, batteryLevel: extracted }; // fusion dans l’objet principal
+        }
+      }
+
+      merged.push(m);
+    }
+    return merged;
+  }
+
+  // ---------------------------
+
+  _reconcile(devices) {
+    // 1) Fusionne "Battery" avec leur parent
+    const devicesMerged = this._groupAndMergeDevices(devices);
+
+    // 2) Création/mise à jour Homebridge
     const seen = new Set();
-    for (const d of devices) {
+    for (const d of devicesMerged) {
       const id = (d.id && String(d.id)) || (d.rrd_id && String(d.rrd_id)) || `${d.deviceType || "DEVICE"}-${d.name || "unknown"}`;
       const name = d.name || `${d.deviceType || "Device"} ${id}`;
       const uuid = this.api.hap.uuid.generate(`sfrhome:${id}`);
@@ -121,7 +226,7 @@ class SFRHomePlatform {
       this._updateValues(accessory, d);
     }
 
-    // --- Étape 3 : suppression des accessoires disparus ---
+    // 3) Supprimer les accessoires disparus (inclura désormais les anciens "Battery" isolés)
     const toRemove = [];
     for (const [uuid, acc] of this.accessories.entries()) {
       if (!seen.has(uuid)) {
@@ -132,23 +237,6 @@ class SFRHomePlatform {
     if (toRemove.length) {
       this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, toRemove);
       toRemove.forEach((acc) => this.log.info(`- Accessoire supprimé: ${acc.displayName}`));
-    }
-  }
-
-
-  _categoryFor(d) {
-    const c = hap.Categories;
-    switch ((d.deviceType || "").toUpperCase()) {
-      case "ALARM_PANEL": return c.SECURITY_SYSTEM;
-      case "MAGNETIC": return c.SENSOR;
-      case "PIR_DETECTOR": return c.SENSOR;
-      case "SMOKE": return c.SENSOR;
-      case "TEMP_HUM": return c.SENSOR;
-      case "LED_BULB_DIMMER":
-      case "LED_BULB_HUE":
-      case "LED_BULB_COLOR":
-      case "ON_OFF_PLUG": return c.LIGHTBULB;
-      default: return c.OTHER;
     }
   }
 
@@ -218,7 +306,6 @@ class SFRHomePlatform {
               if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             } catch (e) {
               this.log.error(`Échec commande ON/OFF pour ${accessory.displayName}: ${e.message}`);
-              // Le prochain refresh remettra l'état réel
             }
           });
         break;
@@ -232,49 +319,15 @@ class SFRHomePlatform {
     const batteryLevel = this._extractBattery(d);
     if (batteryLevel !== null) {
       const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
-      batt.setCharacteristic(Characteristic.BatteryLevel, batteryLevel);
-      batt.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
-      batt.setCharacteristic(
+      this._maybeSet(batt, Characteristic.BatteryLevel, batteryLevel);
+      this._maybeSet(batt, Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
+      this._maybeSet(
+        batt,
         Characteristic.StatusLowBattery,
         batteryLevel <= 20 ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
                            : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
       );
     }
-  }
-
-  _extractBattery(d) {
-    // Retourne un pourcentage 0..100 ou null
-    const direct = parseInt(String(d.batteryLevel ?? ""), 10);
-    if (!isNaN(direct) && direct >= 0 && direct <= 100) return direct;
-
-    const sv = d.sensorValues || {};
-    for (const key of Object.keys(sv)) {
-      if (/battery/i.test(key)) {
-        const raw = String(sv[key].value || "");
-        const n = parseInt(raw.replace("%", "").trim(), 10);
-        if (!isNaN(n) && n >= 0 && n <= 100) return n;
-      }
-    }
-    return null;
-  }
-
-  _boolFromValue(v) {
-    if (typeof v === "boolean") return v;
-    const s = String(v).trim().toLowerCase();
-    return s === "1" || s === "on" || s === "true" || s === "yes";
-  }
-
-  _findOnOffInSensorValues(d) {
-    // Heuristique pour trouver un état On/Off dans sensorValues
-    const sv = d.sensorValues || {};
-    const candidates = ["state","power","on","switch","relay","onoff","status"];
-    for (const name of Object.keys(sv)) {
-      const low = name.toLowerCase();
-      if (candidates.includes(low)) {
-        return this._boolFromValue(sv[name].value);
-      }
-    }
-    return null;
   }
 
   _updateValues(accessory, d) {
@@ -283,14 +336,10 @@ class SFRHomePlatform {
     const getSV = (name) =>
       d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
 
-    // Marquer services comme actifs / pas de faute (évite "Not Detected")
+    // Marquer services "actifs" (évite "Not Detected"), et n’écrire que si supporté
     for (const svc of accessory.services) {
-      if (svc && svc.updateCharacteristic && Characteristic.StatusActive) {
-        try { svc.updateCharacteristic(Characteristic.StatusActive, true); } catch {}
-      }
-      if (svc && svc.updateCharacteristic && Characteristic.StatusFault) {
-        try { svc.updateCharacteristic(Characteristic.StatusFault, Characteristic.StatusFault.NO_FAULT); } catch {}
-      }
+      this._maybeSet(svc, Characteristic.StatusActive, true);
+      this._maybeSet(svc, Characteristic.StatusFault, Characteristic.StatusFault.NO_FAULT);
     }
 
     const status = (d.status || "").toUpperCase();
@@ -300,13 +349,13 @@ class SFRHomePlatform {
       const svc = accessory.getService(Service.SecuritySystem);
       if (svc) {
         const modeRaw = ((status || getSV("AlarmMode") || "") + "").toUpperCase();
-        const map = {
+        const curMap = {
           "OFF": Characteristic.SecuritySystemCurrentState.DISARMED,
-          "CUSTOM": Characteristic.SecuritySystemCurrentState.NIGHT_ARM, // ou STAY_ARM
+          "CUSTOM": Characteristic.SecuritySystemCurrentState.NIGHT_ARM, // ou STAY_ARM selon préférence
           "ON": Characteristic.SecuritySystemCurrentState.AWAY_ARM
         };
-        const cur = map[modeRaw] ?? Characteristic.SecuritySystemCurrentState.DISARMED;
-        svc.updateCharacteristic(Characteristic.SecuritySystemCurrentState, cur);
+        const cur = curMap[modeRaw] ?? Characteristic.SecuritySystemCurrentState.DISARMED;
+        this._maybeSet(svc, Characteristic.SecuritySystemCurrentState, cur);
 
         let target;
         switch (cur) {
@@ -319,32 +368,7 @@ class SFRHomePlatform {
           default:
             target = Characteristic.SecuritySystemTargetState.DISARM;
         }
-        svc.updateCharacteristic(Characteristic.SecuritySystemTargetState, target);
-
-        // Écriture optionnelle
-        if (this.enableWrite && !svc.__writeBound) {
-          svc.__writeBound = true;
-          svc.getCharacteristic(Characteristic.SecuritySystemTargetState).onSet(async (value) => {
-            try {
-              const id = (d.id || d.rrd_id || `${d.deviceType}-${d.name}`) || "panel";
-              const mode = {
-                [Characteristic.SecuritySystemTargetState.DISARM]: "OFF",
-                [Characteristic.SecuritySystemTargetState.STAY_ARM]: "CUSTOM",
-                [Characteristic.SecuritySystemTargetState.NIGHT_ARM]: "CUSTOM",
-                [Characteristic.SecuritySystemTargetState.AWAY_ARM]: "ON",
-              }[value] || "OFF";
-
-              const resp = await fetch(`${this.controlBaseUrl}/api/alarm/set`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ id, mode })
-              });
-              if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            } catch (e) {
-              this.log.error(`Échec commande alarme (${accessory.displayName}): ${e.message}`);
-            }
-          });
-        }
+        this._maybeSet(svc, Characteristic.SecuritySystemTargetState, target);
       }
     }
 
@@ -353,7 +377,8 @@ class SFRHomePlatform {
       const svc = accessory.getService(Service.ContactSensor);
       if (svc) {
         const isOpen = status === "TRIGGERED" || status === "OPEN";
-        svc.updateCharacteristic(
+        this._maybeSet(
+          svc,
           Characteristic.ContactSensorState,
           isOpen
             ? Characteristic.ContactSensorState.CONTACT_NOT_DETECTED
@@ -367,7 +392,7 @@ class SFRHomePlatform {
       const svc = accessory.getService(Service.MotionSensor);
       if (svc) {
         const motion = status === "TRIGGERED";
-        svc.updateCharacteristic(Characteristic.MotionDetected, motion);
+        this._maybeSet(svc, Characteristic.MotionDetected, motion);
       }
     }
 
@@ -376,14 +401,16 @@ class SFRHomePlatform {
       const svc = accessory.getService(Service.SmokeSensor);
       if (svc) {
         const smoke = status === "TRIGGERED" || status === "ALARM";
-        svc.updateCharacteristic(
+        this._maybeSet(
+          svc,
           Characteristic.SmokeDetected,
           smoke ? Characteristic.SmokeDetected.SMOKE_DETECTED
                 : Characteristic.SmokeDetected.SMOKE_NOT_DETECTED
         );
         const bl = this._extractBattery(d);
-        if (bl !== null && Characteristic.StatusLowBattery) {
-          svc.updateCharacteristic(
+        if (bl !== null) {
+          this._maybeSet(
+            svc,
             Characteristic.StatusLowBattery,
             bl <= 20 ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
                      : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
@@ -400,11 +427,11 @@ class SFRHomePlatform {
       const hRaw = getSV("Humidity");
       if (tSvc && typeof tRaw === "string") {
         const n = parseFloat(tRaw.replace("°C", "").trim());
-        if (!isNaN(n)) tSvc.updateCharacteristic(Characteristic.CurrentTemperature, n);
+        if (!isNaN(n)) this._maybeSet(tSvc, Characteristic.CurrentTemperature, n);
       }
       if (hSvc && typeof hRaw === "string") {
         const n = parseFloat(hRaw.replace("%", "").trim());
-        if (!isNaN(n)) hSvc.updateCharacteristic(Characteristic.CurrentRelativeHumidity, n);
+        if (!isNaN(n)) this._maybeSet(hSvc, Characteristic.CurrentRelativeHumidity, n);
       }
     }
 
@@ -414,15 +441,10 @@ class SFRHomePlatform {
       if (svc) {
         const reachable = status !== "UNREACHABLE";
         let on = this._findOnOffInSensorValues(d);
-        if (on === null) {
-          on = reachable; // fallback
-        }
-        if (Characteristic.StatusActive) {
-          svc.updateCharacteristic(Characteristic.StatusActive, reachable);
-        }
-        svc.updateCharacteristic(Characteristic.On, !!on);
+        if (on === null) on = reachable; // fallback
+        this._maybeSet(svc, hap.Characteristic.StatusActive, reachable);
+        this._maybeSet(svc, hap.Characteristic.On, !!on);
       }
     }
   }
 }
-
