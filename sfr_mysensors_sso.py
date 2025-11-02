@@ -3,6 +3,8 @@
 """
 sfr_mysensors_sso.py — SFR Home : SSO robuste + soumission du formulaire final (token_sso)
 + récupération /mysensors + parsing XML -> devices.json + devices.csv
++ ajout d'un device synthétique "Centrale d'alarme" (ALARM_PANEL) depuis les attributs root:
+  name="Centrale", model_type="TSC06SFR", alarm_mode="ON|OFF|CUSTOM"
 
 Dépendances :
     pip install requests lxml beautifulsoup4
@@ -49,16 +51,51 @@ def parse_args():
     p.add_argument("--mysensors-url", default=MYSENSORS_URL_DEFAULT)
     return p.parse_args()
 
-# ---------- parsing XML (corrigé) ----------
+# ---------- parsing XML (avec ALARM_PANEL) ----------
 def parse_sensors_xml(xml_bytes):
     """
     Parse le XML /mysensors et retourne une liste de devices.
-    Correction importante : convertir sv_el.attrib (_Attrib) en dict(...).
+    - Convertit _Attrib en dict standard
+    - Ajoute un device synthétique "Centrale d'alarme" (ALARM_PANEL) si
+      des attributs root name/model_type/alarm_mode sont présents.
     """
     parser = etree.XMLParser(recover=True, encoding='utf-8')
     root = etree.parse(BytesIO(xml_bytes), parser).getroot()
     devices = []
 
+    # 0) Centrale d'alarme depuis les attributs du root (si présents)
+    #    Ex: name="Centrale" model_type="TSC06SFR" alarm_mode="ON|OFF|CUSTOM"
+    root_name = root.attrib.get("name") or root.attrib.get("panel_name") or root.attrib.get("hub_name")
+    root_model = root.attrib.get("model_type") or root.attrib.get("model") or root.attrib.get("type")
+    root_mode = root.attrib.get("alarm_mode") or root.attrib.get("mode")  # ON / OFF / CUSTOM
+    if root_name or root_model or root_mode:
+        panel = {
+            "id": "panel",                # id fixe stable
+            "rrd_id": "-1",
+            "nameable": "1",
+            "brand": "SFR HOME",
+            "zone": "-1",
+            "group": "-1",
+            "testable": "0",
+            "deviceType": "ALARM_PANEL",
+            "deviceModel": root_model or "",
+            "deviceVersion": "1.0",
+            "name": root_name or "Centrale",
+            "long_name": f"Centrale d'alarme ({root_model})" if root_model else "Centrale d'alarme",
+            "batteryLevel": "-2",
+            "signalLevel": "-2",
+            "status": (root_mode or "UNKNOWN").upper(),
+            "categories": "alarm",
+            "sensorValues": {
+                "AlarmMode": {
+                    "value": root_mode or "",
+                    "attrs": {"name": "AlarmMode"}
+                }
+            }
+        }
+        devices.append(panel)
+
+    # 1) Capteurs / actionneurs du XML
     for s in root.findall(".//Sensor"):
         dev = dict(s.attrib)  # attributs du <Sensor>
 
@@ -75,7 +112,7 @@ def parse_sensors_xml(xml_bytes):
             if not name:
                 name = f"value_{len(sv)+1}"
             val = (sv_el.text or "").strip()
-            attrs = dict(sv_el.attrib)  # <<<< clé : convertir en dict
+            attrs = dict(sv_el.attrib)  # convertir en dict standard
             if name in sv:
                 # éviter les collisions de noms
                 idx = 2
@@ -134,6 +171,7 @@ def submit_final_form(session, login_url, token_sso, user=None, password=None):
     injecter token_sso (name attendu), forcer email et passwd si présents,
     inclure le bouton submit s'il existe, POST vers l'action.
     Écrit des fichiers debug_*.html et headers.
+    Retourne l'URL finale après submit.
     """
     r = session.get(login_url, headers={"Referer": login_url, "Accept":"text/html,*/*"}, timeout=20)
     r.raise_for_status()
@@ -160,15 +198,12 @@ def submit_final_form(session, login_url, token_sso, user=None, password=None):
             continue
         payload[name] = value
 
-    # inclure bouton submit si présent
     submit_btn = form.find("input", {"type": "submit"})
     if submit_btn and submit_btn.get("name"):
         payload[submit_btn["name"]] = submit_btn.get("value", "")
 
-    # injection cruciale
     payload["token_sso"] = token_sso
 
-    # forcer email / passwd si ces champs existent mais vides
     if user and "email" in payload and not payload.get("email"):
         payload["email"] = user
     if password and "passwd" in payload and not payload.get("passwd"):
@@ -243,7 +278,6 @@ def main():
         session = requests.Session()
         session.headers.update({"User-Agent":"Mozilla/5.0", "Accept":"*/*", "Cookie": cookie_str})
         xml = fetch_mysensors(session, args.mysensors_url, referer=args.dashboard_url)
-        # Optionnel : sauvegarder l'XML brut
         with open("mysensors_raw.xml","wb") as f:
             f.write(xml)
         print(f"[+] mysensors récupéré ({len(xml)} octets)")
@@ -298,7 +332,6 @@ def main():
     print("[*] Étape 4/4 — Récupération mysensors")
     try:
         xml = fetch_mysensors(session, args.mysensors_url, referer=dash_url or args.dashboard_url)
-        # Optionnel : sauvegarder l'XML brut pour inspection
         with open("mysensors_raw.xml","wb") as f:
             f.write(xml)
         print(f"[+] mysensors récupéré ({len(xml)} octets)")
