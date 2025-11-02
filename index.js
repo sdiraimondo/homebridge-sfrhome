@@ -1,11 +1,8 @@
 // homebridge-sfrhome / index.js
-// v0.3.4 — Fusion robuste des modules "Battery" + parent + % réel, suppression des doublons.
-// - Matching par plusieurs heuristiques (suffixes, variantes, contenu "battery-only"),
-//   + rapprochement par similarité de nom et zone/groupe si dispo.
-// - Extraction du % batterie depuis l'entrée Battery en priorité (regex sur toutes les sensorValues).
-// - "Battery Low" (15%) seulement si aucun pourcentage exploitable n'est trouvé.
-// - Pas d'écriture de caractéristiques non supportées (zéro warning Homebridge).
-// - Écriture optionnelle via API locale, port configurable (controlPort).
+// v0.3.4 — Fusion robuste "Battery" + parent + % réel, suppression doublons, helpers anti-warning.
+// - Matching par variantes de nom + contenu "battery-only"
+// - Extraction du pourcentage depuis toutes les sensorValues, sinon dérivé via Battery Low
+// - Écriture optionnelle via API locale (controlPort configurable)
 
 let hap;
 const PLUGIN_NAME = "homebridge-sfrhome";
@@ -25,18 +22,18 @@ class SFRHomePlatform {
     this.devicesPath = this.config.devicesPath || "/path/vers/devices.json";
     this.refreshSeconds = Number(this.config.refreshSeconds || 60);
 
-    // Fusion & visibilité
-    this.mergeBattery = this.config.mergeBattery !== false; // on par défaut
+    // Fusion batterie
+    this.mergeBattery = this.config.mergeBattery !== false;           // on par défaut
     this.suppressOrphanBattery = this.config.suppressOrphanBattery !== false; // on par défaut
-    this.matchLog = !!this.config.debugBatteryMerge; // logs de matching
+    this.matchLog = !!this.config.debugBatteryMerge; // logs d’appariement
 
-    // Écriture (facultative) — API locale
+    // Écriture (facultative)
     this.enableWrite = !!this.config.enableWrite;
     const base = this.config.controlBaseUrl || "http://127.0.0.1";
     const port = this.config.controlPort || 5000;
     this.controlBaseUrl = `${base.replace(/\/$/, "")}:${port}`;
 
-    this.accessories = new Map(); // uuid -> accessory
+    this.accessories = new Map();
 
     if (!this.devicesPath) {
       this.log.error("devicesPath manquant — configurez-le dans config.json");
@@ -57,19 +54,10 @@ class SFRHomePlatform {
   _tick() {
     const fs = require("fs");
     fs.readFile(this.devicesPath, "utf8", (err, data) => {
-      if (err) {
-        this.log.warn(`Impossible de lire ${this.devicesPath}: ${err.message}`);
-        return;
-      }
+      if (err) { this.log.warn(`Impossible de lire ${this.devicesPath}: ${err.message}`); return; }
       let list;
-      try { list = JSON.parse(data); } catch (e) {
-        this.log.error(`JSON invalide: ${e.message}`);
-        return;
-      }
-      if (!Array.isArray(list)) {
-        this.log.warn("devices.json n'est pas une liste.");
-        return;
-      }
+      try { list = JSON.parse(data); } catch (e) { this.log.error(`JSON invalide: ${e.message}`); return; }
+      if (!Array.isArray(list)) { this.log.warn("devices.json n'est pas une liste."); return; }
       this._reconcile(list);
     });
   }
@@ -103,7 +91,7 @@ class SFRHomePlatform {
     return s === "1" || s === "on" || s === "true" || s === "yes";
   }
 
-  // ---------- Détection & extraction batterie ----------
+  // ---------- Batterie: extraction ----------
   _extractPercentFromString(str) {
     if (typeof str !== "string") return null;
     const m = str.match(/(\d+(?:\.\d+)?)\s*%/);
@@ -111,7 +99,7 @@ class SFRHomePlatform {
       const n = parseFloat(m[1]);
       if (!isNaN(n) && n >= 0 && n <= 100) return n;
     }
-    const m2 = str.match(/^[\s]*([0-9]{1,3})[\s]*$/);
+    const m2 = str.match(/^\s*([0-9]{1,3})\s*$/);
     if (m2) {
       const n2 = parseInt(m2[1], 10);
       if (!isNaN(n2) && n2 >= 0 && n2 <= 100) return n2;
@@ -139,20 +127,34 @@ class SFRHomePlatform {
     return null;
   }
   _extractBattery(d) {
-    // 1) top-level batteryLevel prioritaire si 0..100
     const top = parseInt(String(d.batteryLevel ?? ""), 10);
     if (!isNaN(top) && top >= 0 && top <= 100) return top;
-    // 2) sinon, chercher % dans sensorValues
     const svPercent = this._extractBatteryPercentFromSV(d.sensorValues);
     if (svPercent !== null) return svPercent;
-    // 3) sinon, dériver via low flag
     const low = this._extractBatteryLowFlag(d);
     if (low === true) return 15;
     if (low === false) return 100;
     return null;
   }
 
-  // ---------- Heuristiques d'appariement Battery <-> Main ----------
+  // ---------- ON/OFF depuis sensorValues ----------
+  _findOnOffInSensorValues(d) {
+    const sv = d.sensorValues || {};
+    const candidates = ["state","power","on","switch","relay","onoff","status"];
+    for (const name of Object.keys(sv)) {
+      const low = name.toLowerCase();
+      if (candidates.includes(low)) {
+        const val = sv[name].value;
+        if (typeof val === "string" && /^(on|off|true|false|0|1)$/i.test(val.trim())) {
+          return this._boolFromValue(val);
+        }
+        return this._boolFromValue(val);
+      }
+    }
+    return null;
+  }
+
+  // ---------- Matching Battery <-> Main ----------
   _normalizeNameForBase(n) {
     if (!n) return "";
     let s = String(n);
@@ -164,7 +166,7 @@ class SFRHomePlatform {
   _looksLikeBatteryModule(d) {
     const name = (d.name || "").trim();
     const type = (d.deviceType || "").toUpperCase();
-    const isByName = /\bBattery\)?$/i.test(name);             // "... Battery" ou "...(Battery)"
+    const isByName = /\bBattery\)?$/i.test(name);
     const isByType = ["BATTERY","BATTERY_SENSOR"].includes(type);
     const sv = d.sensorValues || {};
     const keys = Object.keys(sv);
@@ -172,7 +174,6 @@ class SFRHomePlatform {
     return isByName || isByType || hasOnlyBatteryish;
   }
   _nameSimilarity(a, b) {
-    // petite similarité nom sans dépendance externe: ratio du plus long suffixe/prefixe commun
     if (!a || !b) return 0;
     a = a.toLowerCase(); b = b.toLowerCase();
     const minLen = Math.min(a.length, b.length);
@@ -181,18 +182,19 @@ class SFRHomePlatform {
     for (let i=0;i<minLen;i++) if (a[a.length-1-i] === b[b.length-1-i]) suffix++; else break;
     return Math.max(prefix, suffix) / Math.max(a.length, b.length);
   }
+  _stableIdOf(d) {
+    return (d.id && String(d.id)) || (d.rrd_id && String(d.rrd_id)) || `${d.deviceType || "DEVICE"}-${d.name || "unknown"}`;
+  }
 
   _mergeBatteryModules(devices) {
     if (!this.mergeBattery) return { merged: devices.slice(), suppressedIds: new Set() };
 
-    // Index par nom normalisé
     const mainsByBase = new Map();
     const batteries = [];
 
     for (const d of devices) {
-      if (this._looksLikeBatteryModule(d)) {
-        batteries.push(d);
-      } else {
+      if (this._looksLikeBatteryModule(d)) batteries.push(d);
+      else {
         const base = this._normalizeNameForBase(d.name);
         if (!mainsByBase.has(base)) mainsByBase.set(base, []);
         mainsByBase.get(base).push(d);
@@ -200,32 +202,28 @@ class SFRHomePlatform {
     }
 
     const suppressedIds = new Set();
-    const bestBatteryInfo = new Map(); // key = main reference, val = {percent, lowFlag}
+    const bestBatteryInfo = new Map();
 
-    // Essaie d'apparier chaque battery à un main
     for (const b of batteries) {
       const bBase = this._normalizeNameForBase(b.name);
       const candidates = mainsByBase.get(bBase) || [];
 
-      let best = null;
-      let bestScore = -1;
+      let best = null, bestScore = -1;
 
-      // 1) candidats par base exacte
       for (const m of candidates) {
-        // bonus si zone/groupe/brand égaux
-        let score = 0.6; // base match
+        let score = 0.6;
         if (m.zone !== undefined && b.zone !== undefined && String(m.zone) === String(b.zone)) score += 0.2;
         if (m.group !== undefined && b.group !== undefined && String(m.group) === String(b.group)) score += 0.1;
         if ((m.brand||"") && (b.brand||"") && m.brand === b.brand) score += 0.1;
         if (score > bestScore) { bestScore = score; best = m; }
       }
 
-      // 2) sinon, cherche le main le plus proche par similarité dans tout l'index
       if (!best) {
+        // fallback global par similarité
         let globalBest = null, globalScore = -1;
         for (const [base, arr] of mainsByBase.entries()) {
           const sim = this._nameSimilarity(bBase, base);
-          if (sim >= 0.5) { // seuil raisonnable
+          if (sim >= 0.5) {
             for (const m of arr) {
               let score = 0.5 + sim * 0.3;
               if (m.zone !== undefined && b.zone !== undefined && String(m.zone) === String(b.zone)) score += 0.15;
@@ -238,7 +236,6 @@ class SFRHomePlatform {
       }
 
       if (best) {
-        // extrait % depuis le battery
         const percent = this._extractBattery(b);
         const low = this._extractBatteryLowFlag(b);
         const prev = bestBatteryInfo.get(best) || { percent: null, low: null };
@@ -247,24 +244,19 @@ class SFRHomePlatform {
           low: (prev.low === null ? low : prev.low)
         };
         bestBatteryInfo.set(best, next);
-        // marquer le module battery à supprimer
         suppressedIds.add(this._stableIdOf(b));
         if (this.matchLog) this.log.info(`[merge] Battery "${b.name}" → "${best.name}" (score=${bestScore.toFixed(2)})`);
       } else {
         if (this.matchLog) this.log.warn(`[merge] Battery "${b.name}" sans parent trouvé`);
-        if (this.suppressOrphanBattery) {
-          suppressedIds.add(this._stableIdOf(b)); // on masque les orphelins
-        }
+        if (this.suppressOrphanBattery) suppressedIds.add(this._stableIdOf(b));
       }
     }
 
-    // Construire la liste merge
     const merged = [];
     for (const d of devices) {
       const id = this._stableIdOf(d);
-      if (suppressedIds.has(id)) continue; // skip battery mergées/masquées
+      if (suppressedIds.has(id)) continue;
 
-      // si ce device a reçu une info battery issue d’un module battery, l’injecter
       const info = bestBatteryInfo.get(d);
       if (info) {
         const existing = this._extractBattery(d);
@@ -281,16 +273,10 @@ class SFRHomePlatform {
     return { merged, suppressedIds };
   }
 
-  _stableIdOf(d) {
-    return (d.id && String(d.id)) || (d.rrd_id && String(d.rrd_id)) || `${d.deviceType || "DEVICE"}-${d.name || "unknown"}`;
-  }
-
   // ---------- Cycle principal ----------
   _reconcile(devices) {
-    // 1) Fusion Battery → parent (robuste)
     const { merged: devicesMerged } = this._mergeBatteryModules(devices);
 
-    // 2) Création/mise à jour Homebridge
     const seen = new Set();
     for (const d of devicesMerged) {
       const id = this._stableIdOf(d);
@@ -315,7 +301,6 @@ class SFRHomePlatform {
       this._updateValues(accessory, d);
     }
 
-    // 3) Supprimer les accessoires disparus
     const toRemove = [];
     for (const [uuid, acc] of this.accessories.entries()) {
       if (!seen.has(uuid)) {
@@ -332,12 +317,10 @@ class SFRHomePlatform {
   _setupServices(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
 
-    // Nettoyer services (sauf AccessoryInformation)
     accessory.services
       .filter((s) => !(s instanceof Service.AccessoryInformation))
       .forEach((s) => accessory.removeService(s));
 
-    // AccessoryInformation — SerialNumber non-vide
     const info = accessory.getService(Service.AccessoryInformation);
     const serialRaw = this._stableIdOf(d);
     const serial = serialRaw.length > 1 ? serialRaw : `${(d.deviceType || "DEV")}-sn`;
@@ -346,7 +329,6 @@ class SFRHomePlatform {
       .setCharacteristic(Characteristic.Model, d.deviceModel || d.deviceType || "Unknown")
       .setCharacteristic(Characteristic.SerialNumber, serial);
 
-    // Service principal
     switch ((d.deviceType || "").toUpperCase()) {
       case "ALARM_PANEL": {
         accessory.addService(Service.SecuritySystem, accessory.displayName);
@@ -376,10 +358,7 @@ class SFRHomePlatform {
         const svc = accessory.addService(Service.Lightbulb, accessory.displayName);
         svc.getCharacteristic(Characteristic.On)
           .onSet(async (value) => {
-            if (!this.enableWrite) {
-              this.log.warn(`(lecture seule) ${accessory.displayName} -> On=${value}`);
-              return;
-            }
+            if (!this.enableWrite) { this.log.warn(`(lecture seule) ${accessory.displayName} -> On=${value}`); return; }
             try {
               const id = this._stableIdOf(d);
               const resp = await fetch(`${this.controlBaseUrl}/api/device/${encodeURIComponent(id)}/set`, {
@@ -399,7 +378,6 @@ class SFRHomePlatform {
       }
     }
 
-    // BatteryService si pertinent
     const level = this._extractBattery(d);
     if (level !== null) {
       const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
@@ -417,7 +395,6 @@ class SFRHomePlatform {
     const getSV = (name) =>
       d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
 
-    // Actif / pas de faute
     for (const svc of accessory.services) {
       this._maybeSet(svc, Characteristic.StatusActive, true);
       this._maybeSet(svc, Characteristic.StatusFault, Characteristic.StatusFault.NO_FAULT);
