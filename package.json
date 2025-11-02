@@ -1,0 +1,21 @@
+{
+  "name": "homebridge-sfrhome",
+  "version": "0.1.0",
+  "description": "Expose SFR HOME devices to HomeKit via Homebridge using devices.json",
+  "main": "index.js",
+  "keywords": [
+    "homebridge-plugin",
+    "homekit",
+    "sfr",
+    "domotique"
+  ],
+  "engines": {
+    "node": ">=18.0.0",
+    "homebridge": ">=1.6.0"
+  },
+  "license": "MIT",
+  "dependencies": {},
+  "peerDependencies": {
+    "homebridge": ">=1.6.0"
+  }
+}
