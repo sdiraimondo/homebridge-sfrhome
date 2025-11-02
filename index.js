@@ -1,10 +1,11 @@
-// homebridge-sfrhome / index.js — v1.0.1
-// 100% Node: lit SFR directement (SSO + /mysensors), plus besoin de Python/cron.
-// Correction: SerialNumber garanti non-vide et stable pour éviter le rejet HomeKit.
+// homebridge-sfrhome / index.js — v1.1.0
+// 100% Node avec session persistée : on réutilise les cookies pour éviter le SSO à chaque tick.
 
 let hap;
 const PLUGIN_NAME = "homebridge-sfrhome";
 const PLATFORM_NAME = "SFRHomePlatform";
+const path = require("path");
+const os = require("os");
 const { getDevices } = require("./sfrhome-client");
 
 module.exports = (api) => {
@@ -25,7 +26,11 @@ class SFRHomePlatform {
     this.user = this.config.user;
     this.password = this.config.password;
 
-    // Écriture (facultative) — API locale (si tu veux garder l’option)
+    // Session persistée
+    const defaultSession = path.join(os.homedir(), ".homebridge-sfrhome-session.json");
+    this.sessionPath = this.config.sessionPath || defaultSession;
+
+    // Écriture (facultative) — API locale
     this.enableWrite = !!this.config.enableWrite;
     const base = this.config.controlBaseUrl || "http://127.0.0.1";
     const port = this.config.controlPort || 5000;
@@ -39,7 +44,7 @@ class SFRHomePlatform {
     }
 
     this.api.on("didFinishLaunching", () => {
-      this.log.info(`Plateforme prête. refresh=${this.refreshSeconds}s, write=${this.enableWrite ? "ON" : "OFF"}`);
+      this.log.info(`Plateforme prête. refresh=${this.refreshSeconds}s, write=${this.enableWrite ? "ON" : "OFF"}, session=${this.sessionPath}`);
       this._tick();
       this._interval = setInterval(() => this._tick(), this.refreshSeconds * 1000);
     });
@@ -50,15 +55,18 @@ class SFRHomePlatform {
   }
 
   _tick() {
-    getDevices({ user: this.user, pass: this.password })
+    getDevices({
+      user: this.user,
+      pass: this.password,
+      sessionPath: this.sessionPath
+    })
       .then(list => this._reconcile(list))
-      .catch(err => this.log.error(`Erreur SFR: ${err.message}`));
+      .catch(err => this.log.error(`[SFR Home] Erreur SFR: ${err.message}`));
   }
 
-  // ---- helpers --------------------------------------------------------------
+  // ---------------- helpers (inchangés sauf Serial fix) ----------------
 
   _primaryId(d) {
-    // id stable côté SFR si possible
     return (d.id && String(d.id)) ||
            (d.rrd_id && String(d.rrd_id)) ||
            (d.serial && String(d.serial)) ||
@@ -66,32 +74,19 @@ class SFRHomePlatform {
   }
 
   _makeSerial(d, uuid) {
-    // Construit un SerialNumber HomeKit sûr (len > 1), stable, ASCII simple.
     const candidates = [
-      d.serial,
-      d.sn,
-      d.id,
-      d.rrd_id,
+      d.serial, d.sn, d.id, d.rrd_id,
       `${d.deviceType || "DEV"}-${d.name || ""}`
-    ]
-      .filter(v => v != null)
-      .map(v => String(v).trim())
-      .filter(v => v.length > 1 && v.toLowerCase() !== "null" && v.toLowerCase() !== "undefined");
+    ].filter(v => v != null).map(v => String(v).trim())
+     .filter(v => v.length > 1 && v.toLowerCase() !== "null" && v.toLowerCase() !== "undefined");
 
     let serial = candidates[0] || "";
-
-    // Nettoyage: enlever caractères de contrôle, condenser espaces
     serial = serial.replace(/[\x00-\x1F\x7F]/g, "").replace(/\s+/g, " ").trim();
-
-    // Si vide ou trop court après nettoyage, fallback sur UUID
     if (!serial || serial.length <= 1) {
-      const suffix = uuid.replace(/-/g, "").slice(-12); // 12 hex stables
+      const suffix = uuid.replace(/-/g, "").slice(-12);
       serial = `SFR-${suffix}`;
     }
-
-    // Limiter à une longueur raisonnable (HomeKit tolère large, 64 est safe)
     if (serial.length > 64) serial = serial.slice(0, 64);
-
     return serial;
   }
 
@@ -143,7 +138,7 @@ class SFRHomePlatform {
     return null;
   }
 
-  // ---- reconcile & services -------------------------------------------------
+  // ---------------- reconcile/services ----------------
 
   _reconcile(devices) {
     const seen = new Set();
@@ -187,12 +182,12 @@ class SFRHomePlatform {
   _setupServices(accessory, d, uuid) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
 
-    // Nettoyer les services (sauf AccessoryInformation)
+    // Nettoyer services (sauf AccessoryInformation)
     accessory.services
       .filter(s => !(s instanceof Service.AccessoryInformation))
       .forEach(s => accessory.removeService(s));
 
-    // AccessoryInformation — garantir SerialNumber valide
+    // AccessoryInformation
     const info = accessory.getService(Service.AccessoryInformation);
     const serial = this._makeSerial(d, uuid);
     const model = (d.deviceModel || d.deviceType || "Unknown").toString().trim() || "Unknown";
@@ -275,7 +270,7 @@ class SFRHomePlatform {
     const getSV = (name) =>
       d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
 
-    // activer services (évite "Not Detected")
+    // Activer services (évite "Not Detected")
     for (const svc of accessory.services) {
       if (svc && svc.updateCharacteristic && Characteristic.StatusActive) {
         try { svc.updateCharacteristic(Characteristic.StatusActive, true); } catch {}
