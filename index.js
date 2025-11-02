@@ -1,7 +1,9 @@
-// index.js
+// homebridge-sfrhome / index.js
 // Plugin Homebridge lisant devices.json (généré par ton script Python) et exposant des accessoires HomeKit.
 
-let hap, PLUGIN_NAME = "homebridge-sfrhome", PLATFORM_NAME = "SFRHomePlatform";
+let hap;
+const PLUGIN_NAME = "homebridge-sfrhome";
+const PLATFORM_NAME = "SFRHomePlatform";
 
 module.exports = (api) => {
   hap = api.hap;
@@ -23,27 +25,29 @@ class SFRHomePlatform {
       return;
     }
 
-    this.api.on('didFinishLaunching', () => {
+    this.api.on("didFinishLaunching", () => {
       this.log.info(`Plateforme prête. Lecture: ${this.devicesPath}, refresh: ${this.refreshSeconds}s`);
-      this._tick(); // lecture initiale
+      this._tick();
       this._interval = setInterval(() => this._tick(), this.refreshSeconds * 1000);
     });
   }
 
   configureAccessory(accessory) {
-    // Récupère accessoires cachés par Homebridge (restauration cache)
+    // Restauration depuis le cache Homebridge
     this.accessories.set(accessory.UUID, accessory);
   }
 
   _tick() {
-    const fs = require('fs');
-    fs.readFile(this.devicesPath, 'utf8', (err, data) => {
+    const fs = require("fs");
+    fs.readFile(this.devicesPath, "utf8", (err, data) => {
       if (err) {
         this.log.warn(`Impossible de lire ${this.devicesPath}: ${err.message}`);
         return;
       }
       let list;
-      try { list = JSON.parse(data); } catch (e) {
+      try {
+        list = JSON.parse(data);
+      } catch (e) {
         this.log.error(`JSON invalide: ${e.message}`);
         return;
       }
@@ -56,11 +60,10 @@ class SFRHomePlatform {
   }
 
   _reconcile(devices) {
-    // index des équipements par id
     const seen = new Set();
     for (const d of devices) {
-      const id = d.id || d.rrd_id || `${d.deviceType}-${d.name}`;
-      const name = d.name || `${d.deviceType} ${id}`;
+      const id = (d.id && String(d.id)) || (d.rrd_id && String(d.rrd_id)) || `${d.deviceType || "DEVICE"}-${d.name || "unknown"}`;
+      const name = d.name || `${d.deviceType || "Device"} ${id}`;
       const uuid = this.api.hap.uuid.generate(`sfrhome:${id}`);
 
       seen.add(uuid);
@@ -74,16 +77,14 @@ class SFRHomePlatform {
         this.accessories.set(uuid, accessory);
         this.log.info(`+ Accessoire créé: ${name} (${d.deviceType})`);
       } else {
-        // update services (peut-être type changé / renommage)
         accessory.displayName = name;
         this._setupServices(accessory, d);
       }
 
-      // mise à jour des valeurs
       this._updateValues(accessory, d);
     }
 
-    // Retirer les accessoires qui n’apparaissent plus
+    // Supprimer les accessoires disparus
     const toRemove = [];
     for (const [uuid, acc] of this.accessories.entries()) {
       if (!seen.has(uuid)) {
@@ -93,13 +94,14 @@ class SFRHomePlatform {
     }
     if (toRemove.length) {
       this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, toRemove);
-      toRemove.forEach(acc => this.log.info(`- Accessoire supprimé: ${acc.displayName}`));
+      toRemove.forEach((acc) => this.log.info(`- Accessoire supprimé: ${acc.displayName}`));
     }
   }
 
   _categoryFor(d) {
     const c = hap.Categories;
-    switch (d.deviceType) {
+    switch ((d.deviceType || "").toUpperCase()) {
+      case "ALARM_PANEL": return c.SECURITY_SYSTEM;
       case "MAGNETIC": return c.SENSOR;
       case "PIR_DETECTOR": return c.SENSOR;
       case "SMOKE": return c.SENSOR;
@@ -115,22 +117,34 @@ class SFRHomePlatform {
   _setupServices(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
 
-    // Clear services except AccessoryInformation
+    // Nettoyer les services (sauf AccessoryInformation)
     accessory.services
-      .filter(s => !(s instanceof Service.AccessoryInformation))
-      .forEach(s => accessory.removeService(s));
+      .filter((s) => !(s instanceof Service.AccessoryInformation))
+      .forEach((s) => accessory.removeService(s));
 
-    // Always set info
-    accessory.getService(Service.AccessoryInformation)
+    // Always set info — et garantir un SerialNumber valide
+    const info = accessory.getService(Service.AccessoryInformation);
+
+    const rawSerial =
+      (d.id && String(d.id).trim()) ||
+      (d.rrd_id && String(d.rrd_id).trim()) ||
+      `${d.deviceType || "DEVICE"}-${(d.name || "unknown").toString().trim()}`;
+
+    const serial = rawSerial.length > 1 ? rawSerial : `${(d.deviceType || "DEV")}-sn`;
+
+    info
       .setCharacteristic(Characteristic.Manufacturer, d.brand || "SFR HOME")
       .setCharacteristic(Characteristic.Model, d.deviceModel || d.deviceType || "Unknown")
-      .setCharacteristic(Characteristic.SerialNumber, d.id || "n/a");
+      .setCharacteristic(Characteristic.SerialNumber, serial);
 
-    // Choose service by device type
-    switch (d.deviceType) {
+    // Créer le service principal selon deviceType
+    switch ((d.deviceType || "").toUpperCase()) {
+      case "ALARM_PANEL": {
+        accessory.addService(Service.SecuritySystem, accessory.displayName);
+        break;
+      }
       case "MAGNETIC": {
-        const svc = accessory.addService(Service.ContactSensor, accessory.displayName);
-        // Characteristic.ContactSensorState
+        accessory.addService(Service.ContactSensor, accessory.displayName);
         break;
       }
       case "PIR_DETECTOR": {
@@ -151,71 +165,115 @@ class SFRHomePlatform {
       case "LED_BULB_COLOR":
       case "ON_OFF_PLUG": {
         const svc = accessory.addService(Service.Lightbulb, accessory.displayName);
-        // simple ON/OFF (pas de dimmer pour MVP)
+        // MVP: lecture seule (onSet -> log seulement)
         svc.getCharacteristic(Characteristic.On)
           .onSet(async (value) => {
-            // MVP: lecture seule (pas d’action vers SFR Home).
             this.log.warn(`(lecture seule) ${accessory.displayName} -> On=${value}`);
           });
         break;
       }
       default: {
-        // Fallback: MotionSensor (pour être visible)
+        // Fallback visible
         accessory.addService(Service.MotionSensor, accessory.displayName);
       }
     }
   }
 
   _updateValues(accessory, d) {
-    const Characteristic = hap.Characteristic;
-    const status = (d.status || "").toUpperCase();
+    const Service = hap.Service, Characteristic = hap.Characteristic;
 
-    const getSV = (name) => d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
+    const getSV = (name) =>
+      d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
 
-    // MAGNETIC -> ContactSensorState (detected: OPEN)
-    if (d.deviceType === "MAGNETIC") {
-      const svc = accessory.getService(hap.Service.ContactSensor);
-      if (svc) {
-        // pas de valeur explicite -> heuristique : status OK => fermé, sinon ouvert ?
-        // Si tu as un champ plus fiable dans sensorValues, remplace ici.
-        const isOpen = status === "TRIGGERED" || status === "OPEN";
-        svc.updateCharacteristic(Characteristic.ContactSensorState,
-          isOpen ? Characteristic.ContactSensorState.CONTACT_NOT_DETECTED
-                 : Characteristic.ContactSensorState.CONTACT_DETECTED);
+    // Marquer tous les services comme actifs pour éviter "Not Detected"
+    for (const svc of accessory.services) {
+      if (svc && svc.updateCharacteristic && Characteristic.StatusActive) {
+        try { svc.updateCharacteristic(Characteristic.StatusActive, true); } catch {}
+      }
+      if (svc && svc.updateCharacteristic && Characteristic.StatusFault) {
+        try { svc.updateCharacteristic(Characteristic.StatusFault, Characteristic.StatusFault.NO_FAULT); } catch {}
       }
     }
 
-    // PIR_DETECTOR -> MotionDetected
-    if (d.deviceType === "PIR_DETECTOR") {
-      const svc = accessory.getService(hap.Service.MotionSensor);
+    const status = (d.status || "").toUpperCase();
+
+    // Centrale d'alarme -> SecuritySystem
+    if ((d.deviceType || "").toUpperCase() === "ALARM_PANEL") {
+      const svc = accessory.getService(Service.SecuritySystem);
       if (svc) {
-        const motion = (status === "TRIGGERED");
+        const modeRaw = (status || (getSV("AlarmMode") || "")).toUpperCase();
+        const map = {
+          "OFF": Characteristic.SecuritySystemCurrentState.DISARMED,
+          "CUSTOM": Characteristic.SecuritySystemCurrentState.NIGHT_ARM, // ou STAY_ARM selon préférence
+          "ON": Characteristic.SecuritySystemCurrentState.AWAY_ARM
+        };
+        const cur = map[modeRaw] ?? Characteristic.SecuritySystemCurrentState.DISARMED;
+        svc.updateCharacteristic(Characteristic.SecuritySystemCurrentState, cur);
+
+        let target;
+        switch (cur) {
+          case Characteristic.SecuritySystemCurrentState.AWAY_ARM:
+            target = Characteristic.SecuritySystemTargetState.AWAY_ARM; break;
+          case Characteristic.SecuritySystemCurrentState.NIGHT_ARM:
+            target = Characteristic.SecuritySystemTargetState.NIGHT_ARM; break;
+          case Characteristic.SecuritySystemCurrentState.STAY_ARM:
+            target = Characteristic.SecuritySystemTargetState.STAY_ARM; break;
+          default:
+            target = Characteristic.SecuritySystemTargetState.DISARM;
+        }
+        svc.updateCharacteristic(Characteristic.SecuritySystemTargetState, target);
+      }
+    }
+
+    // Capteur magnétique -> ContactSensor
+    if ((d.deviceType || "").toUpperCase() === "MAGNETIC") {
+      const svc = accessory.getService(Service.ContactSensor);
+      if (svc) {
+        // Heuristique : TRIGGERED/OPEN = ouvert
+        const isOpen = status === "TRIGGERED" || status === "OPEN";
+        svc.updateCharacteristic(
+          Characteristic.ContactSensorState,
+          isOpen
+            ? Characteristic.ContactSensorState.CONTACT_NOT_DETECTED
+            : Characteristic.ContactSensorState.CONTACT_DETECTED
+        );
+      }
+    }
+
+    // PIR -> MotionSensor
+    if ((d.deviceType || "").toUpperCase() === "PIR_DETECTOR") {
+      const svc = accessory.getService(Service.MotionSensor);
+      if (svc) {
+        const motion = status === "TRIGGERED";
         svc.updateCharacteristic(Characteristic.MotionDetected, motion);
       }
     }
 
-    // SMOKE -> SmokeDetected
-    if (d.deviceType === "SMOKE") {
-      const svc = accessory.getService(hap.Service.SmokeSensor);
+    // Smoke -> SmokeSensor (+ batterie optionnelle)
+    if ((d.deviceType || "").toUpperCase() === "SMOKE") {
+      const svc = accessory.getService(Service.SmokeSensor);
       if (svc) {
-        const smoke = (status === "TRIGGERED" || status === "ALARM");
-        svc.updateCharacteristic(Characteristic.SmokeDetected,
+        const smoke = status === "TRIGGERED" || status === "ALARM";
+        svc.updateCharacteristic(
+          Characteristic.SmokeDetected,
           smoke ? Characteristic.SmokeDetected.SMOKE_DETECTED
-                : Characteristic.SmokeDetected.SMOKE_NOT_DETECTED);
-        // Optionnel: low battery
+                : Characteristic.SmokeDetected.SMOKE_NOT_DETECTED
+        );
         const bl = parseInt(d.batteryLevel, 10);
-        if (!isNaN(bl)) {
-          svc.updateCharacteristic(Characteristic.StatusLowBattery, bl <= 2
-            ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
-            : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL);
+        if (!isNaN(bl) && Characteristic.StatusLowBattery) {
+          svc.updateCharacteristic(
+            Characteristic.StatusLowBattery,
+            bl <= 2 ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+                    : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
+          );
         }
       }
     }
 
-    // TEMP_HUM -> Temperature/Humidity
-    if (d.deviceType === "TEMP_HUM") {
-      const tSvc = accessory.getService(hap.Service.TemperatureSensor);
-      const hSvc = accessory.getService(hap.Service.HumiditySensor);
+    // Temp/Hum
+    if ((d.deviceType || "").toUpperCase() === "TEMP_HUM") {
+      const tSvc = accessory.getService(Service.TemperatureSensor);
+      const hSvc = accessory.getService(Service.HumiditySensor);
       const tRaw = getSV("Temperature");
       const hRaw = getSV("Humidity");
       if (tSvc && typeof tRaw === "string") {
@@ -228,16 +286,19 @@ class SFRHomePlatform {
       }
     }
 
-    // Lights/Plugs -> lecture seule (On = false si UNREACHABLE)
-    if (["LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR","ON_OFF_PLUG"].includes(d.deviceType)) {
-      const svc = accessory.getService(hap.Service.Lightbulb);
+    // Lights/Plugs -> lecture seule (On = reachable)
+    if (["LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR","ON_OFF_PLUG"].includes((d.deviceType || "").toUpperCase())) {
+      const svc = accessory.getService(Service.Lightbulb);
       if (svc) {
         const isReachable = status !== "UNREACHABLE";
-        svc.updateCharacteristic(Characteristic.On, isReachable); // heuristique MVP
+        if (Characteristic.StatusActive) {
+          svc.updateCharacteristic(Characteristic.StatusActive, isReachable);
+        }
+        svc.updateCharacteristic(Characteristic.On, isReachable);
+        if (Characteristic.StatusFault) {
+          svc.updateCharacteristic(Characteristic.StatusFault, Characteristic.StatusFault.NO_FAULT);
+        }
       }
     }
-
-    // AccessoryInformation: Battery/Signal en Manufacturer/Model extra (facultatif)
-    // (On pourrait aussi exposer un BatteryService si besoin)
   }
 }
