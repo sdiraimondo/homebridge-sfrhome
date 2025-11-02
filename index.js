@@ -1,9 +1,10 @@
-// homebridge-sfrhome / index.js
-// v0.3.0 — BatteryService + mapping ON/OFF + écriture via Flask (optionnel)
+// homebridge-sfrhome / index.js — v1.0.0 (100% Node)
+// Lit directement SFR (SSO + /mysensors), plus besoin de Python/cron.
 
 let hap;
 const PLUGIN_NAME = "homebridge-sfrhome";
 const PLATFORM_NAME = "SFRHomePlatform";
+const { getDevices } = require("./sfrhome-client");
 
 module.exports = (api) => {
   hap = api.hap;
@@ -15,53 +16,42 @@ class SFRHomePlatform {
     this.log = log;
     this.api = api;
     this.config = config || {};
+
     this.name = this.config.name || "SFR Home";
-    this.devicesPath = this.config.devicesPath || "/path/vers/devices.json";
     this.refreshSeconds = Number(this.config.refreshSeconds || 60);
 
-    // Ecriture (facultatif)
-    this.enableWrite = !!this.config.enableWrite;   // true/false
-    this.controlBaseUrl = this.config.controlBaseUrl || "http://127.0.0.1:5000"; // Flask local
+    // Identifiants SFR (requis)
+    this.user = this.config.user;
+    this.password = this.config.password;
 
-    this.accessories = new Map(); // uuid -> accessory
+    // Écriture (facultative) — API locale si tu veux conserver cette option
+    this.enableWrite = !!this.config.enableWrite;
+    const base = this.config.controlBaseUrl || "http://127.0.0.1";
+    const port = this.config.controlPort || 5000;
+    this.controlBaseUrl = `${base.replace(/\/$/, "")}:${port}`;
 
-    if (!this.devicesPath) {
-      this.log.error("devicesPath manquant — configurez-le dans config.json");
+    this.accessories = new Map();
+
+    if (!this.user || !this.password) {
+      this.log.error("Config manquante: 'user' et 'password' sont requis.");
       return;
     }
 
     this.api.on("didFinishLaunching", () => {
-      this.log.info(`Plateforme prête. Lecture: ${this.devicesPath}, refresh: ${this.refreshSeconds}s, write=${this.enableWrite ? "ON" : "OFF"}`);
+      this.log.info(`Plateforme prête. refresh=${this.refreshSeconds}s, write=${this.enableWrite ? "ON" : "OFF"}`);
       this._tick();
       this._interval = setInterval(() => this._tick(), this.refreshSeconds * 1000);
     });
   }
 
   configureAccessory(accessory) {
-    // Restauration depuis le cache Homebridge
     this.accessories.set(accessory.UUID, accessory);
   }
 
   _tick() {
-    const fs = require("fs");
-    fs.readFile(this.devicesPath, "utf8", (err, data) => {
-      if (err) {
-        this.log.warn(`Impossible de lire ${this.devicesPath}: ${err.message}`);
-        return;
-      }
-      let list;
-      try {
-        list = JSON.parse(data);
-      } catch (e) {
-        this.log.error(`JSON invalide: ${e.message}`);
-        return;
-      }
-      if (!Array.isArray(list)) {
-        this.log.warn("devices.json n'est pas une liste.");
-        return;
-      }
-      this._reconcile(list);
-    });
+    getDevices({ user: this.user, pass: this.password })
+      .then(list => this._reconcile(list))
+      .catch(err => this.log.error(`Erreur SFR: ${err.message}`));
   }
 
   _reconcile(devices) {
@@ -89,7 +79,7 @@ class SFRHomePlatform {
       this._updateValues(accessory, d);
     }
 
-    // Supprimer les accessoires disparus
+    // retirer les accessoires non vus
     const toRemove = [];
     for (const [uuid, acc] of this.accessories.entries()) {
       if (!seen.has(uuid)) {
@@ -99,7 +89,7 @@ class SFRHomePlatform {
     }
     if (toRemove.length) {
       this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, toRemove);
-      toRemove.forEach((acc) => this.log.info(`- Accessoire supprimé: ${acc.displayName}`));
+      toRemove.forEach(acc => this.log.info(`- Accessoire supprimé: ${acc.displayName}`));
     }
   }
 
@@ -122,19 +112,17 @@ class SFRHomePlatform {
   _setupServices(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
 
-    // Nettoyer les services (sauf AccessoryInformation)
+    // Nettoyer services (sauf AccessoryInformation)
     accessory.services
-      .filter((s) => !(s instanceof Service.AccessoryInformation))
-      .forEach((s) => accessory.removeService(s));
+      .filter(s => !(s instanceof Service.AccessoryInformation))
+      .forEach(s => accessory.removeService(s));
 
-    // Always set info — SerialNumber non-vide
+    // AccessoryInformation — SerialNumber non vide
     const info = accessory.getService(Service.AccessoryInformation);
-
     const rawSerial =
       (d.id && String(d.id).trim()) ||
       (d.rrd_id && String(d.rrd_id).trim()) ||
       `${d.deviceType || "DEVICE"}-${(d.name || "unknown").toString().trim()}`;
-
     const serial = rawSerial.length > 1 ? rawSerial : `${(d.deviceType || "DEV")}-sn`;
 
     info
@@ -142,7 +130,7 @@ class SFRHomePlatform {
       .setCharacteristic(Characteristic.Model, d.deviceModel || d.deviceType || "Unknown")
       .setCharacteristic(Characteristic.SerialNumber, serial);
 
-    // Service principal selon deviceType
+    // Service principal
     switch ((d.deviceType || "").toUpperCase()) {
       case "ALARM_PANEL": {
         accessory.addService(Service.SecuritySystem, accessory.displayName);
@@ -170,26 +158,24 @@ class SFRHomePlatform {
       case "LED_BULB_COLOR":
       case "ON_OFF_PLUG": {
         const svc = accessory.addService(Service.Lightbulb, accessory.displayName);
-        // ECRITURE (optionnelle) via Flask
-        svc.getCharacteristic(Characteristic.On)
-          .onSet(async (value) => {
-            if (!this.enableWrite) {
-              this.log.warn(`(lecture seule) ${accessory.displayName} -> On=${value}`);
-              return;
-            }
-            try {
-              const id = (d.id || d.rrd_id || `${d.deviceType}-${d.name}`);
-              const resp = await fetch(`${this.controlBaseUrl}/api/device/${encodeURIComponent(id)}/set`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ on: !!value })
-              });
-              if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            } catch (e) {
-              this.log.error(`Echec commande ON/OFF pour ${accessory.displayName}: ${e.message}`);
-              // Laisser HomeKit afficher l'état, le prochain refresh corrigera si besoin
-            }
-          });
+        // écriture optionnelle via API locale (si tu veux garder cette option)
+        svc.getCharacteristic(Characteristic.On).onSet(async (value) => {
+          if (!this.enableWrite) {
+            this.log.warn(`(lecture seule) ${accessory.displayName} -> On=${value}`);
+            return;
+          }
+          try {
+            const id = (d.id || d.rrd_id || `${d.deviceType}-${d.name}`);
+            const resp = await fetch(`${this.controlBaseUrl}/api/device/${encodeURIComponent(id)}/set`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ on: !!value })
+            });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          } catch (e) {
+            this.log.error(`Échec commande ON/OFF pour ${accessory.displayName}: ${e.message}`);
+          }
+        });
         break;
       }
       default: {
@@ -197,7 +183,7 @@ class SFRHomePlatform {
       }
     }
 
-    // BatteryService si pertinent
+    // BatteryService si batterie détectable
     const batteryLevel = this._extractBattery(d);
     if (batteryLevel !== null) {
       const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
@@ -212,15 +198,13 @@ class SFRHomePlatform {
   }
 
   _extractBattery(d) {
-    // Retourne un pourcentage 0..100 ou null si inconnu
     const direct = parseInt(String(d.batteryLevel ?? ""), 10);
     if (!isNaN(direct) && direct >= 0 && direct <= 100) return direct;
-
     const sv = d.sensorValues || {};
     for (const key of Object.keys(sv)) {
       if (/battery/i.test(key)) {
         const raw = String(sv[key].value || "");
-        const n = parseInt(raw.replace("%", "").trim(), 10);
+        const n = parseInt(raw.replace("%","").trim(), 10);
         if (!isNaN(n) && n >= 0 && n <= 100) return n;
       }
     }
@@ -234,7 +218,6 @@ class SFRHomePlatform {
   }
 
   _findOnOffInSensorValues(d) {
-    // Heuristique pour trouver un état On/Off fiable dans sensorValues
     const sv = d.sensorValues || {};
     const candidates = ["state","power","on","switch","relay","onoff","status"];
     for (const name of Object.keys(sv)) {
@@ -252,7 +235,7 @@ class SFRHomePlatform {
     const getSV = (name) =>
       d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
 
-    // Marquer tous les services actifs / sans faute (évite "Non détecté")
+    // activer services (évite "Not Detected")
     for (const svc of accessory.services) {
       if (svc && svc.updateCharacteristic && Characteristic.StatusActive) {
         try { svc.updateCharacteristic(Characteristic.StatusActive, true); } catch {}
@@ -264,14 +247,14 @@ class SFRHomePlatform {
 
     const status = (d.status || "").toUpperCase();
 
-    // Centrale d'alarme -> SecuritySystem
+    // Alarme
     if ((d.deviceType || "").toUpperCase() === "ALARM_PANEL") {
       const svc = accessory.getService(Service.SecuritySystem);
       if (svc) {
         const modeRaw = ((status || getSV("AlarmMode") || "") + "").toUpperCase();
         const map = {
           "OFF": Characteristic.SecuritySystemCurrentState.DISARMED,
-          "CUSTOM": Characteristic.SecuritySystemCurrentState.NIGHT_ARM, // ou STAY_ARM
+          "CUSTOM": Characteristic.SecuritySystemCurrentState.NIGHT_ARM,
           "ON": Characteristic.SecuritySystemCurrentState.AWAY_ARM
         };
         const cur = map[modeRaw] ?? Characteristic.SecuritySystemCurrentState.DISARMED;
@@ -289,31 +272,6 @@ class SFRHomePlatform {
             target = Characteristic.SecuritySystemTargetState.DISARM;
         }
         svc.updateCharacteristic(Characteristic.SecuritySystemTargetState, target);
-
-        // (Optionnel) onSet pour la centrale si écriture activée
-        if (this.enableWrite && !svc.__writeBound) {
-          svc.__writeBound = true;
-          svc.getCharacteristic(Characteristic.SecuritySystemTargetState).onSet(async (value) => {
-            try {
-              const id = (d.id || d.rrd_id || `${d.deviceType}-${d.name}`) || "panel";
-              const mode = {
-                [Characteristic.SecuritySystemTargetState.DISARM]: "OFF",
-                [Characteristic.SecuritySystemTargetState.STAY_ARM]: "CUSTOM",
-                [Characteristic.SecuritySystemTargetState.NIGHT_ARM]: "CUSTOM",
-                [Characteristic.SecuritySystemTargetState.AWAY_ARM]: "ON",
-              }[value] || "OFF";
-
-              const resp = await fetch(`${this.controlBaseUrl}/api/alarm/set`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ id, mode })
-              });
-              if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            } catch (e) {
-              this.log.error(`Echec commande alarme (${accessory.displayName}): ${e.message}`);
-            }
-          });
-        }
       }
     }
 
@@ -368,29 +326,24 @@ class SFRHomePlatform {
       const tRaw = getSV("Temperature");
       const hRaw = getSV("Humidity");
       if (tSvc && typeof tRaw === "string") {
-        const n = parseFloat(tRaw.replace("°C", "").trim());
+        const n = parseFloat(tRaw.replace("°C","").trim());
         if (!isNaN(n)) tSvc.updateCharacteristic(Characteristic.CurrentTemperature, n);
       }
       if (hSvc && typeof hRaw === "string") {
-        const n = parseFloat(hRaw.replace("%", "").trim());
+        const n = parseFloat(hRaw.replace("%","").trim());
         if (!isNaN(n)) hSvc.updateCharacteristic(Characteristic.CurrentRelativeHumidity, n);
       }
     }
 
-    // Lights/Plugs : ON réel si sensorValues contient un indicateur
+    // Lumières / prises
     if (["LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR","ON_OFF_PLUG"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.Lightbulb);
       if (svc) {
         const reachable = status !== "UNREACHABLE";
         let on = this._findOnOffInSensorValues(d);
-        if (on === null) {
-          // fallback : si reachable => ON (heuristique)
-          on = reachable;
-        }
-        if (hap.Characteristic.StatusActive) {
-          svc.updateCharacteristic(hap.Characteristic.StatusActive, reachable);
-        }
-        svc.updateCharacteristic(hap.Characteristic.On, !!on);
+        if (on === null) on = reachable; // fallback
+        if (Characteristic.StatusActive) svc.updateCharacteristic(Characteristic.StatusActive, reachable);
+        svc.updateCharacteristic(Characteristic.On, !!on);
       }
     }
   }
