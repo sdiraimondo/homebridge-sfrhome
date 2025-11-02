@@ -1,18 +1,37 @@
-// sfrhome-client.js — Client SFR robuste (SSO + submit login + mysensors + parse XML)
+// sfrhome-client.js — v1.1.0
+// SSO robuste + session persistée (CookieJar sur disque) + warm-up /accueil
 
+const fs = require("fs");
 const axios = require("axios").default;
 const { wrapper: axiosCookieJarSupport } = require("axios-cookiejar-support");
-const { CookieJar } = require("tough-cookie");
+const { CookieJar, fromJSON } = require("tough-cookie");
 const cheerio = require("cheerio");
 const { XMLParser } = require("fast-xml-parser");
 
 const BASE = "https://home.sfr.fr/";
 const LOGIN_URL = "https://home.sfr.fr/login";
+const ACCUEIL_URL = "https://home.sfr.fr/accueil";
 const SSO = "https://home.sfr.fr/sso-connector.php";
 const MYSENSORS = "https://home.sfr.fr/mysensors";
 
-function makeClient() {
-  const jar = new CookieJar();
+function loadJar(sessionPath) {
+  try {
+    if (sessionPath && fs.existsSync(sessionPath)) {
+      const data = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
+      return fromJSON(data);
+    }
+  } catch { /* ignore */ }
+  return new CookieJar();
+}
+function saveJar(jar, sessionPath) {
+  try {
+    if (!sessionPath) return;
+    const json = jar.toJSON();
+    fs.writeFileSync(sessionPath, JSON.stringify(json), "utf8");
+  } catch { /* ignore */ }
+}
+
+function makeClient(jar) {
   const client = axios.create({
     timeout: 20000,
     headers: {
@@ -24,7 +43,7 @@ function makeClient() {
     withCredentials: true,
     jar,
     maxRedirects: 5,
-    validateStatus: s => s >= 200 && s < 400 // considérer 3xx comme "ok" (axios suit les redirects)
+    validateStatus: s => s >= 200 && s < 400
   });
   axiosCookieJarSupport(client);
   return client;
@@ -33,17 +52,12 @@ function makeClient() {
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function getLoginPage(client) {
-  // Amorçage des cookies
   const r = await client.get(LOGIN_URL, {
-    headers: {
-      "Referer": LOGIN_URL,
-      "Origin": BASE.slice(0, -1)
-    }
+    headers: { "Referer": LOGIN_URL, "Origin": BASE.slice(0, -1) }
   });
   return r.data;
 }
 
-// 1) POST SSO -> token_sso (avec retry)
 async function postSSO(client, user, pass) {
   const form = new URLSearchParams({ connectionSFR: user, passSFR: pass });
   const headers = {
@@ -58,12 +72,11 @@ async function postSSO(client, user, pass) {
   let token = await tryPostSSO(client, form, headers);
   if (token) return token;
 
-  // petite pause + rechargement /login + tentative 2
+  // retry
   await sleep(500);
   await getLoginPage(client);
   await sleep(250);
   token = await tryPostSSO(client, form, headers);
-
   if (!token) throw new Error("token_sso manquant dans la réponse SSO");
   return token;
 }
@@ -71,28 +84,29 @@ async function postSSO(client, user, pass) {
 async function tryPostSSO(client, form, headers) {
   try {
     const r = await client.post(SSO, form, { headers });
-    // axios validateStatus laisse passer 3xx — si 3xx, r.data peut être vide
     let data = r.data;
     if (typeof data === "string") {
-      // parfois le serveur renvoie du texte JSON
       try { data = JSON.parse(data); } catch { /* noop */ }
     }
     const token = data?.result?.token_sso;
     if (token) return token;
 
-    // log compact pour debug, sans fuite sensible
+    const success = data?.success;
+    if (success === false) {
+      // souvent rate-limit ou mauvais timing — on laisse remonter un null pour retry
+      console.warn(`[SFR SSO] Réponse inattendue (success=false)`);
+      return null;
+    }
     const snippet = (typeof data === "string" ? data : JSON.stringify(data || {})).slice(0, 200);
     console.warn("[SFR SSO] Réponse inattendue (extrait):", snippet);
     return null;
   } catch (e) {
-    // remonter le code si 4xx/5xx
     const status = e.response?.status;
     const snippet = (e.response?.data ? (typeof e.response.data === "string" ? e.response.data : JSON.stringify(e.response.data)) : "").slice(0, 200);
     throw new Error(`POST SSO échoué${status ? " ("+status+")" : ""}${snippet ? " — "+snippet : ""}`);
   }
 }
 
-// 2) GET /login + POST formulaire final avec name="token_sso"
 async function submitFinalForm(client, token, user) {
   const html = await getLoginPage(client);
   const $ = cheerio.load(html);
@@ -120,29 +134,26 @@ async function submitFinalForm(client, token, user) {
   };
 
   const r2 = await client.post(action, new URLSearchParams(payload), { headers });
-  // donner un peu de temps à la session pour se stabiliser
+  // Warm-up tableau de bord pour poser d'éventuels cookies
+  await client.get(ACCUEIL_URL, { headers: { "Referer": LOGIN_URL } });
   await sleep(200);
-  // parfois le serveur renvoie une page login encore une fois, pas grave si cookies posés
   const finalUrl = r2.request?.res?.responseUrl || action;
   return finalUrl;
 }
 
-// 3) GET /mysensors (XML)
 async function fetchMySensorsXML(client) {
   const r = await client.get(MYSENSORS, {
     headers: {
       "Accept": "application/xml,text/xml,*/*",
       "X-Requested-With": "XMLHttpRequest",
-      "Referer": BASE
+      "Referer": ACCUEIL_URL
     },
     responseType: "text",
-    // si le serveur répond 403/401, on veut voir l'erreur
     validateStatus: s => s >= 200 && s < 300
   });
-  return r.data; // XML string
+  return r.data;
 }
 
-// util — chercher le premier nœud qui contient 'Sensor'
 function findSensorsNode(obj) {
   if (!obj || typeof obj !== "object") return null;
   if (Object.prototype.hasOwnProperty.call(obj, "Sensor")) return obj;
@@ -153,7 +164,6 @@ function findSensorsNode(obj) {
   return null;
 }
 
-// 4) Parse XML -> devices (incluant ALARM_PANEL depuis les attributs racine)
 function parseDevices(xml) {
   const parser = new XMLParser({
     ignoreAttributes: false,
@@ -166,7 +176,6 @@ function parseDevices(xml) {
 
   const devices = [];
 
-  // ALARM PANEL depuis root
   const panelName = sensorsNode?.name;
   const panelModel = sensorsNode?.model_type || sensorsNode?.model || sensorsNode?.type;
   const panelMode = (sensorsNode?.alarm_mode || sensorsNode?.mode || "").toUpperCase();
@@ -188,7 +197,6 @@ function parseDevices(xml) {
     });
   }
 
-  // Liste des capteurs
   const list = Array.isArray(sensorsNode?.Sensor)
     ? sensorsNode.Sensor
     : (sensorsNode?.Sensor ? [sensorsNode.Sensor] : []);
@@ -196,13 +204,11 @@ function parseDevices(xml) {
   for (const s of list) {
     const dev = { ...s, sensorValues: null };
 
-    // normaliser champs texte imbriqués
     for (const key of ["deviceType","deviceModel","deviceVersion","name","long_name","batteryLevel","signalLevel","status","categories"]) {
       const v = s?.[key];
       if (v && typeof v === "object" && "#text" in v) dev[key] = String(v["#text"]);
     }
 
-    // sensorValues
     const sv = {};
     const svRaw = s?.sensorValue;
     if (svRaw) {
@@ -233,23 +239,44 @@ function parseDevices(xml) {
   return devices;
 }
 
-// API principale
-async function getDevices({ user, pass }) {
-  const client = makeClient();
-
-  // 1) amorcer cookies
-  await getLoginPage(client);
-
-  // 2) SSO avec retry
-  const token = await postSSO(client, user, pass);
-
-  // 3) soumettre formulaire final
-  await submitFinalForm(client, token, user);
-
-  // 4) récupérer mysensors
+async function useExistingSessionFirst(client) {
   try {
     const xml = await fetchMySensorsXML(client);
     return parseDevices(xml);
+  } catch (e) {
+    // 403 attendu si session expirée
+    return null;
+  }
+}
+
+// API principale
+async function getDevices({ user, pass, sessionPath }) {
+  const jar = loadJar(sessionPath);
+  const client = makeClient(jar);
+
+  // 0) Essayer d'abord la session existante
+  const fromSession = await useExistingSessionFirst(client);
+  if (fromSession) {
+    saveJar(jar, sessionPath);
+    return fromSession;
+  }
+
+  // 1) Amorcer /login
+  await getLoginPage(client);
+
+  // 2) SSO (avec retry)
+  const token = await postSSO(client, user, pass);
+
+  // 3) Soumettre formulaire final + warm-up /accueil
+  await submitFinalForm(client, token, user);
+
+  // 4) Récupérer /mysensors
+  try {
+    const xml = await fetchMySensorsXML(client);
+    const devices = parseDevices(xml);
+    // 5) Sauvegarder la session pour les prochains ticks
+    saveJar(jar, sessionPath);
+    return devices;
   } catch (e) {
     const status = e.response?.status;
     const snippet = (e.response?.data ? (typeof e.response.data === "string" ? e.response.data : JSON.stringify(e.response.data)) : "").slice(0, 200);
