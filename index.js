@@ -1,10 +1,10 @@
 // homebridge-sfrhome / index.js
-// v0.3.1-p1 — Base 0.3.1 avec patch minimal :
-// - Pré-indexe les devices nommés "* Battery" pour récupérer un % réel
-// - Ajoute BatteryService au device parent
-// - N'ENREGISTRE PAS les accessoires "* Battery" (plus de doublon)
-// - Aucune heuristique complexe : suffixe exact " Battery" uniquement
-// - Reste du comportement identique à 0.3.1
+// v0.3.1-p2 — Base 0.3.1, SANS fusion, avec normalisation du batteryLevel :
+// - 0..10 => *10 (ex: 3 => 30%)
+// - 255, -2, -1 => ignoré
+// - Status LOW_BAT => flag low battery si aucun niveau fiable
+// - Pas d'accessoire "* Battery" (ton JSON n'en contient pas, donc pas de doublons)
+// - Reste identique à 0.3.1 (catégories, services, lecture On/Off)
 
 let hap;
 const PLUGIN_NAME = "homebridge-sfrhome";
@@ -70,7 +70,7 @@ class SFRHomePlatform {
     });
   }
 
-  // ---------- Helpers 0.3.1 ----------
+  // ---------- Helpers ----------
   _categoryFor(d) {
     const c = hap.Categories;
     switch ((d.deviceType || "").toUpperCase()) {
@@ -138,71 +138,69 @@ class SFRHomePlatform {
     return null;
   }
 
-  _extractBattery(d) {
-    // 0.3.1 : d'abord top-level, sinon SV
-    const top = parseInt(String(d.batteryLevel ?? ""), 10);
-    if (!isNaN(top) && top >= 0 && top <= 100) return top;
+  _extractBatteryNormalized(d) {
+    // 1) top-level
+    const raw = d.batteryLevel !== undefined ? parseInt(String(d.batteryLevel), 10) : null;
+    if (raw !== null && !isNaN(raw)) {
+      if (raw === 255 || raw === -2 || raw === -1) {
+        // secteur / inconnu
+        // ne retourne pas de niveau (mais on pourra poser un flag low via status)
+      } else if (raw >= 0 && raw <= 10) {
+        return Math.max(0, Math.min(100, raw * 10)); // échelle /10 -> %
+      } else if (raw >= 0 && raw <= 100) {
+        return raw;
+      }
+    }
+    // 2) sinon, tenter un % dans sensorValues (au cas où)
     const svPercent = this._extractBatteryPercentFromSV(d.sensorValues);
-    if (svPercent !== null) return svPercent;
+    if (svPercent !== null) return Math.max(0, Math.min(100, svPercent));
+
+    // rien de fiable
     return null;
   }
 
-  // ---------- Patch minimal : lire les % depuis "* Battery" ----------
-  _buildBatteryMap(devices) {
-    // { "Cuisine" : 87, "Salon" : 52, ... } à partir des entrées "Cuisine Battery"
-    const map = new Map();
-    for (const d of devices) {
-      const name = (d.name || "").trim();
-      if (!name) continue;
-      const m = name.match(/\sBattery$/i);
-      if (!m) continue;
-      const base = name.replace(/\sBattery$/i, "").trim();
-      const percent = this._extractBattery(d);
-      if (percent !== null) {
-        // garde la meilleure valeur si plusieurs (par prudence)
-        const prev = map.has(base) ? map.get(base) : null;
-        map.set(base, prev === null ? percent : Math.max(prev, percent));
+  _hasLowBatFlag(d) {
+    // LOW_BAT dans status
+    if (String(d.status || "").toUpperCase() === "LOW_BAT") return true;
+    // certains devices exposent LowBattery/StatusLowBattery dans sensorValues (peu probable ici)
+    const sv = d.sensorValues || {};
+    for (const k of Object.keys(sv)) {
+      if (/statuslowbattery|lowbattery|batterylow/i.test(k)) {
+        const s = String(sv[k].value).trim().toLowerCase();
+        if (["1","true","yes","low"].includes(s)) return true;
       }
     }
-    return map;
+    return false;
   }
 
+  // ---------- Cycle principal (0.3.1 sans fusion) ----------
   _reconcile(devices) {
-    // 1) Construire la map des % à partir des devices "* Battery"
-    const batteryMap = this._buildBatteryMap(devices);
-
-    // 2) Créer / MAJ accessoires pour TOUS sauf "* Battery"
     const seen = new Set();
-    for (const d of devices) {
-      const name = (d.name || "").trim();
-      if (/\sBattery$/i.test(name)) {
-        // PATCH : on n’enregistre pas l’accessoire "* Battery"
-        continue;
-      }
 
+    for (const d of devices) {
       const id = this._stableIdOf(d);
-      const display = name || `${d.deviceType || "Device"} ${id}`;
+      const name = (d.name || "").trim() || `${d.deviceType || "Device"} ${id}`;
       const uuid = this.api.hap.uuid.generate(`sfrhome:${id}`);
 
       seen.add(uuid);
 
       let accessory = this.accessories.get(uuid);
       if (!accessory) {
-        accessory = new this.api.platformAccessory(display, uuid);
+        accessory = new this.api.platformAccessory(name, uuid);
         accessory.category = this._categoryFor(d);
-        this._setupServices(accessory, d, batteryMap);
+        this._setupServices(accessory, d);
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
         this.accessories.set(uuid, accessory);
-        this.log.info(`+ Accessoire créé: ${display} (${d.deviceType})`);
+        this.log.info(`+ Accessoire créé: ${name} (${d.deviceType})`);
       } else {
-        accessory.displayName = display;
-        this._setupServices(accessory, d, batteryMap);
+        accessory.displayName = name;
+        this._setupServices(accessory, d);
       }
 
-      this._updateValues(accessory, d, batteryMap);
+      this._updateValues(accessory, d);
     }
 
-    // 3) Supprimer accessoires disparus (y compris anciens "* Battery")
+    // retirer ceux qui n'existent plus
     const toRemove = [];
     for (const [uuid, acc] of this.accessories.entries()) {
       if (!seen.has(uuid)) {
@@ -216,7 +214,7 @@ class SFRHomePlatform {
     }
   }
 
-  _setupServices(accessory, d, batteryMap) {
+  _setupServices(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
 
     // Nettoyer services (sauf AccessoryInformation)
@@ -281,31 +279,29 @@ class SFRHomePlatform {
         accessory.addService(Service.MotionSensor, accessory.displayName);
     }
 
-    // PATCH : BatteryService sur le parent si on a un % pour son nom
-    const baseName = (d.name || "").trim();
-    const levelFromBattery = batteryMap.has(baseName) ? batteryMap.get(baseName) : null;
-    const levelSelf = this._extractBattery(d); // au cas où le parent a lui-même un %
-    const finalLevel = levelFromBattery !== null ? levelFromBattery : levelSelf;
+    // BatteryService si pertinent (normalisé)
+    const level = this._extractBatteryNormalized(d); // 0..10 → *10, 255/-2/-1 ignoré
+    const lowFlag = this._hasLowBatFlag(d);
 
-    if (finalLevel !== null) {
+    if (level !== null || lowFlag) {
       const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
+      const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
       batt.setCharacteristic(Characteristic.BatteryLevel, Math.max(0, Math.min(100, finalLevel)));
       batt.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
       batt.setCharacteristic(
         Characteristic.StatusLowBattery,
-        finalLevel <= 20 ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
-                         : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
+        (level !== null ? (level <= 20) : lowFlag)
+          ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+          : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
       );
     }
   }
 
-  _updateValues(accessory, d /*, batteryMap */) {
+  _updateValues(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
 
     const getSV = (name) =>
       d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
-
-    // 0.3.1 : pas d'écriture de caractéristiques "exotiques" (on reste simple)
 
     const status = (d.status || "").toUpperCase();
 
