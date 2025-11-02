@@ -1,5 +1,5 @@
 // homebridge-sfrhome / index.js
-// Plugin Homebridge lisant devices.json (généré par ton script Python) et exposant des accessoires HomeKit.
+// v0.3.0 — BatteryService + mapping ON/OFF + écriture via Flask (optionnel)
 
 let hap;
 const PLUGIN_NAME = "homebridge-sfrhome";
@@ -18,6 +18,11 @@ class SFRHomePlatform {
     this.name = this.config.name || "SFR Home";
     this.devicesPath = this.config.devicesPath || "/path/vers/devices.json";
     this.refreshSeconds = Number(this.config.refreshSeconds || 60);
+
+    // Ecriture (facultatif)
+    this.enableWrite = !!this.config.enableWrite;   // true/false
+    this.controlBaseUrl = this.config.controlBaseUrl || "http://127.0.0.1:5000"; // Flask local
+
     this.accessories = new Map(); // uuid -> accessory
 
     if (!this.devicesPath) {
@@ -26,7 +31,7 @@ class SFRHomePlatform {
     }
 
     this.api.on("didFinishLaunching", () => {
-      this.log.info(`Plateforme prête. Lecture: ${this.devicesPath}, refresh: ${this.refreshSeconds}s`);
+      this.log.info(`Plateforme prête. Lecture: ${this.devicesPath}, refresh: ${this.refreshSeconds}s, write=${this.enableWrite ? "ON" : "OFF"}`);
       this._tick();
       this._interval = setInterval(() => this._tick(), this.refreshSeconds * 1000);
     });
@@ -122,7 +127,7 @@ class SFRHomePlatform {
       .filter((s) => !(s instanceof Service.AccessoryInformation))
       .forEach((s) => accessory.removeService(s));
 
-    // Always set info — et garantir un SerialNumber valide
+    // Always set info — SerialNumber non-vide
     const info = accessory.getService(Service.AccessoryInformation);
 
     const rawSerial =
@@ -137,7 +142,7 @@ class SFRHomePlatform {
       .setCharacteristic(Characteristic.Model, d.deviceModel || d.deviceType || "Unknown")
       .setCharacteristic(Characteristic.SerialNumber, serial);
 
-    // Créer le service principal selon deviceType
+    // Service principal selon deviceType
     switch ((d.deviceType || "").toUpperCase()) {
       case "ALARM_PANEL": {
         accessory.addService(Service.SecuritySystem, accessory.displayName);
@@ -165,18 +170,80 @@ class SFRHomePlatform {
       case "LED_BULB_COLOR":
       case "ON_OFF_PLUG": {
         const svc = accessory.addService(Service.Lightbulb, accessory.displayName);
-        // MVP: lecture seule (onSet -> log seulement)
+        // ECRITURE (optionnelle) via Flask
         svc.getCharacteristic(Characteristic.On)
           .onSet(async (value) => {
-            this.log.warn(`(lecture seule) ${accessory.displayName} -> On=${value}`);
+            if (!this.enableWrite) {
+              this.log.warn(`(lecture seule) ${accessory.displayName} -> On=${value}`);
+              return;
+            }
+            try {
+              const id = (d.id || d.rrd_id || `${d.deviceType}-${d.name}`);
+              const resp = await fetch(`${this.controlBaseUrl}/api/device/${encodeURIComponent(id)}/set`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ on: !!value })
+              });
+              if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            } catch (e) {
+              this.log.error(`Echec commande ON/OFF pour ${accessory.displayName}: ${e.message}`);
+              // Laisser HomeKit afficher l'état, le prochain refresh corrigera si besoin
+            }
           });
         break;
       }
       default: {
-        // Fallback visible
         accessory.addService(Service.MotionSensor, accessory.displayName);
       }
     }
+
+    // BatteryService si pertinent
+    const batteryLevel = this._extractBattery(d);
+    if (batteryLevel !== null) {
+      const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
+      batt.setCharacteristic(Characteristic.BatteryLevel, batteryLevel);
+      batt.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
+      batt.setCharacteristic(
+        Characteristic.StatusLowBattery,
+        batteryLevel <= 20 ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+                           : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
+      );
+    }
+  }
+
+  _extractBattery(d) {
+    // Retourne un pourcentage 0..100 ou null si inconnu
+    const direct = parseInt(String(d.batteryLevel ?? ""), 10);
+    if (!isNaN(direct) && direct >= 0 && direct <= 100) return direct;
+
+    const sv = d.sensorValues || {};
+    for (const key of Object.keys(sv)) {
+      if (/battery/i.test(key)) {
+        const raw = String(sv[key].value || "");
+        const n = parseInt(raw.replace("%", "").trim(), 10);
+        if (!isNaN(n) && n >= 0 && n <= 100) return n;
+      }
+    }
+    return null;
+  }
+
+  _boolFromValue(v) {
+    if (typeof v === "boolean") return v;
+    const s = String(v).trim().toLowerCase();
+    return s === "1" || s === "on" || s === "true" || s === "yes";
+  }
+
+  _findOnOffInSensorValues(d) {
+    // Heuristique pour trouver un état On/Off fiable dans sensorValues
+    const sv = d.sensorValues || {};
+    const candidates = ["state","power","on","switch","relay","onoff","status"];
+    for (const name of Object.keys(sv)) {
+      const low = name.toLowerCase();
+      if (candidates.includes(low)) {
+        return this._boolFromValue(sv[name].value);
+      }
+    }
+    return null;
   }
 
   _updateValues(accessory, d) {
@@ -185,7 +252,7 @@ class SFRHomePlatform {
     const getSV = (name) =>
       d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
 
-    // Marquer tous les services comme actifs pour éviter "Not Detected"
+    // Marquer tous les services actifs / sans faute (évite "Non détecté")
     for (const svc of accessory.services) {
       if (svc && svc.updateCharacteristic && Characteristic.StatusActive) {
         try { svc.updateCharacteristic(Characteristic.StatusActive, true); } catch {}
@@ -201,10 +268,10 @@ class SFRHomePlatform {
     if ((d.deviceType || "").toUpperCase() === "ALARM_PANEL") {
       const svc = accessory.getService(Service.SecuritySystem);
       if (svc) {
-        const modeRaw = (status || (getSV("AlarmMode") || "")).toUpperCase();
+        const modeRaw = ((status || getSV("AlarmMode") || "") + "").toUpperCase();
         const map = {
           "OFF": Characteristic.SecuritySystemCurrentState.DISARMED,
-          "CUSTOM": Characteristic.SecuritySystemCurrentState.NIGHT_ARM, // ou STAY_ARM selon préférence
+          "CUSTOM": Characteristic.SecuritySystemCurrentState.NIGHT_ARM, // ou STAY_ARM
           "ON": Characteristic.SecuritySystemCurrentState.AWAY_ARM
         };
         const cur = map[modeRaw] ?? Characteristic.SecuritySystemCurrentState.DISARMED;
@@ -222,14 +289,38 @@ class SFRHomePlatform {
             target = Characteristic.SecuritySystemTargetState.DISARM;
         }
         svc.updateCharacteristic(Characteristic.SecuritySystemTargetState, target);
+
+        // (Optionnel) onSet pour la centrale si écriture activée
+        if (this.enableWrite && !svc.__writeBound) {
+          svc.__writeBound = true;
+          svc.getCharacteristic(Characteristic.SecuritySystemTargetState).onSet(async (value) => {
+            try {
+              const id = (d.id || d.rrd_id || `${d.deviceType}-${d.name}`) || "panel";
+              const mode = {
+                [Characteristic.SecuritySystemTargetState.DISARM]: "OFF",
+                [Characteristic.SecuritySystemTargetState.STAY_ARM]: "CUSTOM",
+                [Characteristic.SecuritySystemTargetState.NIGHT_ARM]: "CUSTOM",
+                [Characteristic.SecuritySystemTargetState.AWAY_ARM]: "ON",
+              }[value] || "OFF";
+
+              const resp = await fetch(`${this.controlBaseUrl}/api/alarm/set`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id, mode })
+              });
+              if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            } catch (e) {
+              this.log.error(`Echec commande alarme (${accessory.displayName}): ${e.message}`);
+            }
+          });
+        }
       }
     }
 
-    // Capteur magnétique -> ContactSensor
+    // Contact
     if ((d.deviceType || "").toUpperCase() === "MAGNETIC") {
       const svc = accessory.getService(Service.ContactSensor);
       if (svc) {
-        // Heuristique : TRIGGERED/OPEN = ouvert
         const isOpen = status === "TRIGGERED" || status === "OPEN";
         svc.updateCharacteristic(
           Characteristic.ContactSensorState,
@@ -240,7 +331,7 @@ class SFRHomePlatform {
       }
     }
 
-    // PIR -> MotionSensor
+    // PIR
     if ((d.deviceType || "").toUpperCase() === "PIR_DETECTOR") {
       const svc = accessory.getService(Service.MotionSensor);
       if (svc) {
@@ -249,7 +340,7 @@ class SFRHomePlatform {
       }
     }
 
-    // Smoke -> SmokeSensor (+ batterie optionnelle)
+    // Smoke
     if ((d.deviceType || "").toUpperCase() === "SMOKE") {
       const svc = accessory.getService(Service.SmokeSensor);
       if (svc) {
@@ -259,12 +350,12 @@ class SFRHomePlatform {
           smoke ? Characteristic.SmokeDetected.SMOKE_DETECTED
                 : Characteristic.SmokeDetected.SMOKE_NOT_DETECTED
         );
-        const bl = parseInt(d.batteryLevel, 10);
-        if (!isNaN(bl) && Characteristic.StatusLowBattery) {
+        const bl = this._extractBattery(d);
+        if (bl !== null && Characteristic.StatusLowBattery) {
           svc.updateCharacteristic(
             Characteristic.StatusLowBattery,
-            bl <= 2 ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
-                    : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
+            bl <= 20 ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+                     : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
           );
         }
       }
@@ -286,18 +377,20 @@ class SFRHomePlatform {
       }
     }
 
-    // Lights/Plugs -> lecture seule (On = reachable)
+    // Lights/Plugs : ON réel si sensorValues contient un indicateur
     if (["LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR","ON_OFF_PLUG"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.Lightbulb);
       if (svc) {
-        const isReachable = status !== "UNREACHABLE";
-        if (Characteristic.StatusActive) {
-          svc.updateCharacteristic(Characteristic.StatusActive, isReachable);
+        const reachable = status !== "UNREACHABLE";
+        let on = this._findOnOffInSensorValues(d);
+        if (on === null) {
+          // fallback : si reachable => ON (heuristique)
+          on = reachable;
         }
-        svc.updateCharacteristic(Characteristic.On, isReachable);
-        if (Characteristic.StatusFault) {
-          svc.updateCharacteristic(Characteristic.StatusFault, Characteristic.StatusFault.NO_FAULT);
+        if (hap.Characteristic.StatusActive) {
+          svc.updateCharacteristic(hap.Characteristic.StatusActive, reachable);
         }
+        svc.updateCharacteristic(hap.Characteristic.On, !!on);
       }
     }
   }
