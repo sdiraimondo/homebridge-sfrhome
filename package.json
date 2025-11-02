@@ -1,6 +1,6 @@
 {
   "name": "homebridge-sfrhome",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Expose SFR HOME devices to HomeKit via Homebridge using devices.json",
   "main": "index.js",
   "keywords": [
