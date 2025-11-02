@@ -1,5 +1,6 @@
-// homebridge-sfrhome / index.js — v1.0.0 (100% Node)
-// Lit directement SFR (SSO + /mysensors), plus besoin de Python/cron.
+// homebridge-sfrhome / index.js — v1.0.1
+// 100% Node: lit SFR directement (SSO + /mysensors), plus besoin de Python/cron.
+// Correction: SerialNumber garanti non-vide et stable pour éviter le rejet HomeKit.
 
 let hap;
 const PLUGIN_NAME = "homebridge-sfrhome";
@@ -24,7 +25,7 @@ class SFRHomePlatform {
     this.user = this.config.user;
     this.password = this.config.password;
 
-    // Écriture (facultative) — API locale si tu veux conserver cette option
+    // Écriture (facultative) — API locale (si tu veux garder l’option)
     this.enableWrite = !!this.config.enableWrite;
     const base = this.config.controlBaseUrl || "http://127.0.0.1";
     const port = this.config.controlPort || 5000;
@@ -54,43 +55,44 @@ class SFRHomePlatform {
       .catch(err => this.log.error(`Erreur SFR: ${err.message}`));
   }
 
-  _reconcile(devices) {
-    const seen = new Set();
-    for (const d of devices) {
-      const id = (d.id && String(d.id)) || (d.rrd_id && String(d.rrd_id)) || `${d.deviceType || "DEVICE"}-${d.name || "unknown"}`;
-      const name = d.name || `${d.deviceType || "Device"} ${id}`;
-      const uuid = this.api.hap.uuid.generate(`sfrhome:${id}`);
+  // ---- helpers --------------------------------------------------------------
 
-      seen.add(uuid);
+  _primaryId(d) {
+    // id stable côté SFR si possible
+    return (d.id && String(d.id)) ||
+           (d.rrd_id && String(d.rrd_id)) ||
+           (d.serial && String(d.serial)) ||
+           `${d.deviceType || "DEVICE"}-${d.name || "unknown"}`;
+  }
 
-      let accessory = this.accessories.get(uuid);
-      if (!accessory) {
-        accessory = new this.api.platformAccessory(name, uuid);
-        accessory.category = this._categoryFor(d);
-        this._setupServices(accessory, d);
-        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-        this.accessories.set(uuid, accessory);
-        this.log.info(`+ Accessoire créé: ${name} (${d.deviceType})`);
-      } else {
-        accessory.displayName = name;
-        this._setupServices(accessory, d);
-      }
+  _makeSerial(d, uuid) {
+    // Construit un SerialNumber HomeKit sûr (len > 1), stable, ASCII simple.
+    const candidates = [
+      d.serial,
+      d.sn,
+      d.id,
+      d.rrd_id,
+      `${d.deviceType || "DEV"}-${d.name || ""}`
+    ]
+      .filter(v => v != null)
+      .map(v => String(v).trim())
+      .filter(v => v.length > 1 && v.toLowerCase() !== "null" && v.toLowerCase() !== "undefined");
 
-      this._updateValues(accessory, d);
+    let serial = candidates[0] || "";
+
+    // Nettoyage: enlever caractères de contrôle, condenser espaces
+    serial = serial.replace(/[\x00-\x1F\x7F]/g, "").replace(/\s+/g, " ").trim();
+
+    // Si vide ou trop court après nettoyage, fallback sur UUID
+    if (!serial || serial.length <= 1) {
+      const suffix = uuid.replace(/-/g, "").slice(-12); // 12 hex stables
+      serial = `SFR-${suffix}`;
     }
 
-    // retirer les accessoires non vus
-    const toRemove = [];
-    for (const [uuid, acc] of this.accessories.entries()) {
-      if (!seen.has(uuid)) {
-        toRemove.push(acc);
-        this.accessories.delete(uuid);
-      }
-    }
-    if (toRemove.length) {
-      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, toRemove);
-      toRemove.forEach(acc => this.log.info(`- Accessoire supprimé: ${acc.displayName}`));
-    }
+    // Limiter à une longueur raisonnable (HomeKit tolère large, 64 est safe)
+    if (serial.length > 64) serial = serial.slice(0, 64);
+
+    return serial;
   }
 
   _categoryFor(d) {
@@ -109,25 +111,96 @@ class SFRHomePlatform {
     }
   }
 
-  _setupServices(accessory, d) {
+  _extractBattery(d) {
+    const direct = parseInt(String(d.batteryLevel ?? ""), 10);
+    if (!isNaN(direct) && direct >= 0 && direct <= 100) return direct;
+    const sv = d.sensorValues || {};
+    for (const key of Object.keys(sv)) {
+      if (/battery/i.test(key)) {
+        const raw = String(sv[key].value || "");
+        const n = parseInt(raw.replace("%","").trim(), 10);
+        if (!isNaN(n) && n >= 0 && n <= 100) return n;
+      }
+    }
+    return null;
+  }
+
+  _boolFromValue(v) {
+    if (typeof v === "boolean") return v;
+    const s = String(v).trim().toLowerCase();
+    return s === "1" || s === "on" || s === "true" || s === "yes";
+  }
+
+  _findOnOffInSensorValues(d) {
+    const sv = d.sensorValues || {};
+    const candidates = ["state","power","on","switch","relay","onoff","status"];
+    for (const name of Object.keys(sv)) {
+      const low = name.toLowerCase();
+      if (candidates.includes(low)) {
+        return this._boolFromValue(sv[name].value);
+      }
+    }
+    return null;
+  }
+
+  // ---- reconcile & services -------------------------------------------------
+
+  _reconcile(devices) {
+    const seen = new Set();
+
+    for (const d of devices) {
+      const id = this._primaryId(d);
+      const name = (d.name || `${d.deviceType || "Device"} ${id}`).toString();
+      const uuid = this.api.hap.uuid.generate(`sfrhome:${id}`);
+
+      seen.add(uuid);
+
+      let accessory = this.accessories.get(uuid);
+      if (!accessory) {
+        accessory = new this.api.platformAccessory(name, uuid);
+        accessory.category = this._categoryFor(d);
+        this._setupServices(accessory, d, uuid);
+        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+        this.accessories.set(uuid, accessory);
+        this.log.info(`+ Accessoire créé: ${name} (${d.deviceType})`);
+      } else {
+        accessory.displayName = name;
+        this._setupServices(accessory, d, uuid);
+      }
+
+      this._updateValues(accessory, d);
+    }
+
+    const toRemove = [];
+    for (const [uuid, acc] of this.accessories.entries()) {
+      if (!seen.has(uuid)) {
+        toRemove.push(acc);
+        this.accessories.delete(uuid);
+      }
+    }
+    if (toRemove.length) {
+      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, toRemove);
+      toRemove.forEach(acc => this.log.info(`- Accessoire supprimé: ${acc.displayName}`));
+    }
+  }
+
+  _setupServices(accessory, d, uuid) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
 
-    // Nettoyer services (sauf AccessoryInformation)
+    // Nettoyer les services (sauf AccessoryInformation)
     accessory.services
       .filter(s => !(s instanceof Service.AccessoryInformation))
       .forEach(s => accessory.removeService(s));
 
-    // AccessoryInformation — SerialNumber non vide
+    // AccessoryInformation — garantir SerialNumber valide
     const info = accessory.getService(Service.AccessoryInformation);
-    const rawSerial =
-      (d.id && String(d.id).trim()) ||
-      (d.rrd_id && String(d.rrd_id).trim()) ||
-      `${d.deviceType || "DEVICE"}-${(d.name || "unknown").toString().trim()}`;
-    const serial = rawSerial.length > 1 ? rawSerial : `${(d.deviceType || "DEV")}-sn`;
+    const serial = this._makeSerial(d, uuid);
+    const model = (d.deviceModel || d.deviceType || "Unknown").toString().trim() || "Unknown";
+    const manufacturer = (d.brand || "SFR HOME").toString().trim() || "SFR HOME";
 
     info
-      .setCharacteristic(Characteristic.Manufacturer, d.brand || "SFR HOME")
-      .setCharacteristic(Characteristic.Model, d.deviceModel || d.deviceType || "Unknown")
+      .setCharacteristic(Characteristic.Manufacturer, manufacturer)
+      .setCharacteristic(Characteristic.Model, model)
       .setCharacteristic(Characteristic.SerialNumber, serial);
 
     // Service principal
@@ -158,7 +231,6 @@ class SFRHomePlatform {
       case "LED_BULB_COLOR":
       case "ON_OFF_PLUG": {
         const svc = accessory.addService(Service.Lightbulb, accessory.displayName);
-        // écriture optionnelle via API locale (si tu veux garder cette option)
         svc.getCharacteristic(Characteristic.On).onSet(async (value) => {
           if (!this.enableWrite) {
             this.log.warn(`(lecture seule) ${accessory.displayName} -> On=${value}`);
@@ -195,38 +267,6 @@ class SFRHomePlatform {
                            : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
       );
     }
-  }
-
-  _extractBattery(d) {
-    const direct = parseInt(String(d.batteryLevel ?? ""), 10);
-    if (!isNaN(direct) && direct >= 0 && direct <= 100) return direct;
-    const sv = d.sensorValues || {};
-    for (const key of Object.keys(sv)) {
-      if (/battery/i.test(key)) {
-        const raw = String(sv[key].value || "");
-        const n = parseInt(raw.replace("%","").trim(), 10);
-        if (!isNaN(n) && n >= 0 && n <= 100) return n;
-      }
-    }
-    return null;
-  }
-
-  _boolFromValue(v) {
-    if (typeof v === "boolean") return v;
-    const s = String(v).trim().toLowerCase();
-    return s === "1" || s === "on" || s === "true" || s === "yes";
-  }
-
-  _findOnOffInSensorValues(d) {
-    const sv = d.sensorValues || {};
-    const candidates = ["state","power","on","switch","relay","onoff","status"];
-    for (const name of Object.keys(sv)) {
-      const low = name.toLowerCase();
-      if (candidates.includes(low)) {
-        return this._boolFromValue(sv[name].value);
-      }
-    }
-    return null;
   }
 
   _updateValues(accessory, d) {
