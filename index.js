@@ -1,6 +1,7 @@
 // homebridge-sfrhome / index.js
-// v0.3.2 — Fusion "Battery" + parent, et écriture de caractéristiques seulement si supportées.
-// (Conserve tout le reste : BatteryService, mapping ON/OFF réel, écriture optionnelle via API locale, controlPort configurable)
+// v0.3.3 — Fusion robuste des devices "Battery" + parent et BatteryLevel dérivé si % absent.
+// + garde: écriture de caractéristiques seulement si supportées (pas d’avertissements Homebridge).
+// + toujours: BatteryService, mapping ON/OFF, écriture optionnelle via API locale, controlPort configurable.
 
 let hap;
 const PLUGIN_NAME = "homebridge-sfrhome";
@@ -85,7 +86,6 @@ class SFRHomePlatform {
   }
 
   _maybeSet(svc, Char, value) {
-    // N’écrit la caractéristique que si le service la supporte (évite les warnings Homebridge)
     try {
       if (!svc || !Char) return;
       if (typeof svc.testCharacteristic === "function" && !svc.testCharacteristic(Char)) {
@@ -95,19 +95,50 @@ class SFRHomePlatform {
     } catch (_) {}
   }
 
-  _extractBattery(d) {
-    // Retourne un pourcentage 0..100 ou null
-    const direct = parseInt(String(d.batteryLevel ?? ""), 10);
-    if (!isNaN(direct) && direct >= 0 && direct <= 100) return direct;
-
-    const sv = d.sensorValues || {};
-    for (const key of Object.keys(sv)) {
-      if (/battery/i.test(key)) {
-        const raw = String(sv[key].value || "");
-        const n = parseInt(raw.replace("%", "").trim(), 10);
+  _extractBatteryPercentFromSV(sv) {
+    // Cherche un pourcentage exploitable dans sensorValues
+    if (!sv) return null;
+    const keys = Object.keys(sv);
+    for (const k of keys) {
+      if (/battery(level)?/i.test(k)) {
+        const raw = String(sv[k].value ?? "").trim();
+        const n = parseInt(raw.replace("%", ""), 10);
         if (!isNaN(n) && n >= 0 && n <= 100) return n;
       }
     }
+    return null;
+  }
+
+  _extractBatteryLowFlag(d) {
+    // Détecte un indicateur "batterie faible" dans status/sensorValues
+    const sv = d.sensorValues || {};
+    // Clés fréquentes : StatusLowBattery, LowBattery, BatteryLow
+    for (const k of Object.keys(sv)) {
+      if (/statuslowbattery|lowbattery|batterylow/i.test(k)) {
+        const v = sv[k].value;
+        const s = String(v).trim().toLowerCase();
+        if (s === "1" || s === "true" || s === "yes" || s === "low") return true;
+        if (s === "0" || s === "false" || s === "no" || s === "ok" || s === "normal") return false;
+      }
+    }
+    return null;
+  }
+
+  _extractBattery(d) {
+    // 1) prioritise un champ numérique au top-level
+    const top = parseInt(String(d.batteryLevel ?? ""), 10);
+    if (!isNaN(top) && top >= 0 && top <= 100) return top;
+
+    // 2) sinon, cherche dans sensorValues
+    const svPercent = this._extractBatteryPercentFromSV(d.sensorValues);
+    if (svPercent !== null) return svPercent;
+
+    // 3) sinon, déduis d’un flag low-battery si présent
+    const low = this._extractBatteryLowFlag(d);
+    if (low === true) return 15;   // valeur conventionnelle
+    if (low === false) return 100; // valeur conventionnelle
+
+    // 4) inconnu
     return null;
   }
 
@@ -118,87 +149,98 @@ class SFRHomePlatform {
   }
 
   _findOnOffInSensorValues(d) {
-    // Heuristique pour trouver un état On/Off dans sensorValues
     const sv = d.sensorValues || {};
     const candidates = ["state","power","on","switch","relay","onoff","status"];
     for (const name of Object.keys(sv)) {
       const low = name.toLowerCase();
       if (candidates.includes(low)) {
         const val = sv[name].value;
-        // gère ON/OFF/1/0/true/false
         if (typeof val === "string" && /^(on|off|true|false|0|1)$/i.test(val.trim())) {
           return this._boolFromValue(val);
         }
-        // sinon on tente parse bool
         return this._boolFromValue(val);
       }
     }
     return null;
   }
 
-  _baseNameForBattery(name) {
-    if (!name) return { base: "", isBattery: false };
-    const trimmed = String(name).trim();
-    if (/ Battery$/i.test(trimmed)) {
-      return { base: trimmed.replace(/\s+Battery$/i, "").trim(), isBattery: true };
-    }
-    return { base: trimmed, isBattery: false };
+  _looksLikeBatteryModule(d) {
+    const name = (d.name || "").trim();
+    const type = (d.deviceType || "").toUpperCase();
+    const isByName = /\sBattery$/i.test(name);
+    const isByType = type === "BATTERY" || type === "BATTERY_SENSOR";
+    const sv = d.sensorValues || {};
+    const keys = Object.keys(sv);
+    const hasOnlyBatteryish =
+      keys.length > 0 &&
+      keys.every(k => /battery|low/i.test(k));
+    return isByName || isByType || hasOnlyBatteryish;
+  }
+
+  _baseName(name) {
+    return String(name || "").trim().replace(/\s+Battery$/i, "").trim();
   }
 
   _groupAndMergeDevices(devices) {
-    // Regroupe par "nom de base" : "Cuisine" et "Cuisine Battery" → groupe "Cuisine"
+    // Regroupe par nom de base ET tente un appariement "battery module" → "main"
     const groups = new Map();
+
+    // 1) Collecte
     for (const d of devices) {
-      const { base, isBattery } = this._baseNameForBattery(d.name || "");
-      const key = base || (d.name || "");
-      if (!groups.has(key)) groups.set(key, { main: null, battery: null, extras: [] });
-
-      const g = groups.get(key);
-      if (isBattery) {
-        g.battery = d;
-      } else {
-        // S’il y a plusieurs "main", on choisit le premier avec deviceType capteur/utile
-        if (!g.main) {
-          g.main = d;
-        } else {
-          g.extras.push(d); // on ne perd rien, mais on n’exposera pas ces doublons
-        }
-      }
+      const base = this._baseName(d.name);
+      if (!groups.has(base)) groups.set(base, { mains: [], batteries: [], raws: [] });
+      const g = groups.get(base);
+      if (this._looksLikeBatteryModule(d)) g.batteries.push(d);
+      else g.mains.push(d);
+      g.raws.push(d);
     }
 
-    // Produit la liste des devices fusionnés
+    // 2) Choix du "main" et fusion batterie → main
     const merged = [];
-    for (const [key, g] of groups.entries()) {
-      let m = g.main || g.battery; // au pire, si on n’a QUE le battery (rare), on le garde
-      if (!m) continue;
+    for (const [base, g] of groups.entries()) {
+      // Sélectionne un main prioritaire : capteurs/actionneurs connus d’abord
+      const preferredOrder = ["ALARM_PANEL","MAGNETIC","PIR_DETECTOR","SMOKE","TEMP_HUM","LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR","ON_OFF_PLUG"];
+      const mainsSorted = g.mains.slice().sort((a,b) => {
+        const ia = preferredOrder.indexOf((a.deviceType || "").toUpperCase());
+        const ib = preferredOrder.indexOf((b.deviceType || "").toUpperCase());
+        return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+      });
+      let main = mainsSorted[0] || g.batteries[0]; // au pire, garder la batterie seule
 
-      // Injecte un niveau de batterie si “Battery” existe
-      if (g.battery) {
-        const fromSV = g.battery.sensorValues?.Battery?.value;
-        const fromTop = g.battery.batteryLevel;
-        const extracted = (() => {
-          if (typeof fromSV === "string") {
-            const n = parseInt(fromSV.replace("%", "").trim(), 10);
-            if (!isNaN(n)) return n;
-          }
-          const n2 = parseInt(String(fromTop ?? ""), 10);
-          return !isNaN(n2) ? n2 : null;
-        })();
+      if (!main) continue; // rien de montrable
 
-        if (extracted !== null) {
-          m = { ...m, batteryLevel: extracted }; // fusion dans l’objet principal
+      // Fusionne la meilleure info batterie trouvée dans les batteries associées
+      let bestPercent = null;
+      let lowFlag = null;
+      for (const b of g.batteries) {
+        const p = this._extractBattery({ ...b }); // ré-usage de la même logique
+        if (p !== null) bestPercent = Math.max(bestPercent ?? -1, p);
+        if (lowFlag === null) {
+          const lf = this._extractBatteryLowFlag(b);
+          if (lf !== null) lowFlag = lf;
         }
       }
+      // Si main a déjà une valeur, la prioriser
+      const mainP = this._extractBattery(main);
+      if (mainP !== null) bestPercent = mainP;
 
-      merged.push(m);
+      // Injecte dans l’objet main
+      if (bestPercent !== null) {
+        main = { ...main, batteryLevel: bestPercent };
+      } else if (lowFlag !== null) {
+        main = { ...main, batteryLevel: lowFlag ? 15 : 100 };
+      }
+
+      merged.push(main);
     }
+
     return merged;
   }
 
   // ---------------------------
 
   _reconcile(devices) {
-    // 1) Fusionne "Battery" avec leur parent
+    // 1) Fusionne "Battery" avec leur parent (robuste)
     const devicesMerged = this._groupAndMergeDevices(devices);
 
     // 2) Création/mise à jour Homebridge
@@ -226,7 +268,7 @@ class SFRHomePlatform {
       this._updateValues(accessory, d);
     }
 
-    // 3) Supprimer les accessoires disparus (inclura désormais les anciens "Battery" isolés)
+    // 3) Supprimer les accessoires disparus (inclut les anciens “Battery” isolés)
     const toRemove = [];
     for (const [uuid, acc] of this.accessories.entries()) {
       if (!seen.has(uuid)) {
@@ -319,14 +361,13 @@ class SFRHomePlatform {
     const batteryLevel = this._extractBattery(d);
     if (batteryLevel !== null) {
       const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
-      this._maybeSet(batt, Characteristic.BatteryLevel, batteryLevel);
+      this._maybeSet(batt, Characteristic.BatteryLevel, Math.max(0, Math.min(100, batteryLevel)));
       this._maybeSet(batt, Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
-      this._maybeSet(
-        batt,
-        Characteristic.StatusLowBattery,
-        batteryLevel <= 20 ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
-                           : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
-      );
+
+      // Flag low battery si on peut le déduire
+      const low = batteryLevel <= 20 ? hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+                                     : hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL;
+      this._maybeSet(batt, Characteristic.StatusLowBattery, low);
     }
   }
 
@@ -336,7 +377,7 @@ class SFRHomePlatform {
     const getSV = (name) =>
       d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
 
-    // Marquer services "actifs" (évite "Not Detected"), et n’écrire que si supporté
+    // Marquer services "actifs" (évite "Not Detected")
     for (const svc of accessory.services) {
       this._maybeSet(svc, Characteristic.StatusActive, true);
       this._maybeSet(svc, Characteristic.StatusFault, Characteristic.StatusFault.NO_FAULT);
@@ -351,7 +392,7 @@ class SFRHomePlatform {
         const modeRaw = ((status || getSV("AlarmMode") || "") + "").toUpperCase();
         const curMap = {
           "OFF": Characteristic.SecuritySystemCurrentState.DISARMED,
-          "CUSTOM": Characteristic.SecuritySystemCurrentState.NIGHT_ARM, // ou STAY_ARM selon préférence
+          "CUSTOM": Characteristic.SecuritySystemCurrentState.NIGHT_ARM, // ou STAY_ARM
           "ON": Characteristic.SecuritySystemCurrentState.AWAY_ARM
         };
         const cur = curMap[modeRaw] ?? Characteristic.SecuritySystemCurrentState.DISARMED;
