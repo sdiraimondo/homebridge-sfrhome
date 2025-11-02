@@ -1,4 +1,4 @@
-// sfrhome-client.js — Client SFR 100% Node (SSO + submit login + fetch /mysensors + parse XML)
+// sfrhome-client.js — Client SFR robuste (SSO + submit login + mysensors + parse XML)
 
 const axios = require("axios").default;
 const { wrapper: axiosCookieJarSupport } = require("axios-cookiejar-support");
@@ -16,32 +16,86 @@ function makeClient() {
   const client = axios.create({
     timeout: 20000,
     headers: {
-      "User-Agent": "Mozilla/5.0",
-      "Accept": "*/*"
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
+      "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Connection": "keep-alive"
     },
     withCredentials: true,
-    jar
+    jar,
+    maxRedirects: 5,
+    validateStatus: s => s >= 200 && s < 400 // considérer 3xx comme "ok" (axios suit les redirects)
   });
   axiosCookieJarSupport(client);
   return client;
 }
 
-// 1) POST SSO -> token_sso
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function getLoginPage(client) {
+  // Amorçage des cookies
+  const r = await client.get(LOGIN_URL, {
+    headers: {
+      "Referer": LOGIN_URL,
+      "Origin": BASE.slice(0, -1)
+    }
+  });
+  return r.data;
+}
+
+// 1) POST SSO -> token_sso (avec retry)
 async function postSSO(client, user, pass) {
-  const r = await client.post(
-    SSO,
-    new URLSearchParams({ connectionSFR: user, passSFR: pass }),
-    { headers: { Origin: BASE.slice(0, -1), Referer: LOGIN_URL } }
-  );
-  const token = r.data?.result?.token_sso;
+  const form = new URLSearchParams({ connectionSFR: user, passSFR: pass });
+  const headers = {
+    "Origin": BASE.slice(0, -1),
+    "Referer": LOGIN_URL,
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest"
+  };
+
+  // tentative 1
+  let token = await tryPostSSO(client, form, headers);
+  if (token) return token;
+
+  // petite pause + rechargement /login + tentative 2
+  await sleep(500);
+  await getLoginPage(client);
+  await sleep(250);
+  token = await tryPostSSO(client, form, headers);
+
   if (!token) throw new Error("token_sso manquant dans la réponse SSO");
   return token;
 }
 
+async function tryPostSSO(client, form, headers) {
+  try {
+    const r = await client.post(SSO, form, { headers });
+    // axios validateStatus laisse passer 3xx — si 3xx, r.data peut être vide
+    let data = r.data;
+    if (typeof data === "string") {
+      // parfois le serveur renvoie du texte JSON
+      try { data = JSON.parse(data); } catch { /* noop */ }
+    }
+    const token = data?.result?.token_sso;
+    if (token) return token;
+
+    // log compact pour debug, sans fuite sensible
+    const snippet = (typeof data === "string" ? data : JSON.stringify(data || {})).slice(0, 200);
+    console.warn("[SFR SSO] Réponse inattendue (extrait):", snippet);
+    return null;
+  } catch (e) {
+    // remonter le code si 4xx/5xx
+    const status = e.response?.status;
+    const snippet = (e.response?.data ? (typeof e.response.data === "string" ? e.response.data : JSON.stringify(e.response.data)) : "").slice(0, 200);
+    throw new Error(`POST SSO échoué${status ? " ("+status+")" : ""}${snippet ? " — "+snippet : ""}`);
+  }
+}
+
 // 2) GET /login + POST formulaire final avec name="token_sso"
 async function submitFinalForm(client, token, user) {
-  const r = await client.get(LOGIN_URL, { headers: { Referer: LOGIN_URL } });
-  const $ = cheerio.load(r.data);
+  const html = await getLoginPage(client);
+  const $ = cheerio.load(html);
   const form = $("#login_form_add_rib").attr("action") ? $("#login_form_add_rib") : $("#loginForm");
   if (!form || !form.attr("action")) throw new Error("Formulaire final de login introuvable");
 
@@ -57,13 +111,18 @@ async function submitFinalForm(client, token, user) {
   });
 
   payload["token_sso"] = token;
-  // si le champ 'email' existe et est vide, le remplir (souvent optionnel)
   if ("email" in payload && !payload.email) payload.email = user;
 
-  const r2 = await client.post(action, new URLSearchParams(payload), {
-    headers: { Origin: BASE.slice(0, -1), Referer: LOGIN_URL },
-    maxRedirects: 5
-  });
+  const headers = {
+    "Origin": BASE.slice(0, -1),
+    "Referer": LOGIN_URL,
+    "Content-Type": "application/x-www-form-urlencoded"
+  };
+
+  const r2 = await client.post(action, new URLSearchParams(payload), { headers });
+  // donner un peu de temps à la session pour se stabiliser
+  await sleep(200);
+  // parfois le serveur renvoie une page login encore une fois, pas grave si cookies posés
   const finalUrl = r2.request?.res?.responseUrl || action;
   return finalUrl;
 }
@@ -76,7 +135,9 @@ async function fetchMySensorsXML(client) {
       "X-Requested-With": "XMLHttpRequest",
       "Referer": BASE
     },
-    responseType: "text"
+    responseType: "text",
+    // si le serveur répond 403/401, on veut voir l'erreur
+    validateStatus: s => s >= 200 && s < 300
   });
   return r.data; // XML string
 }
@@ -101,13 +162,11 @@ function parseDevices(xml) {
     allowBooleanAttributes: true
   });
   const parsed = parser.parse(xml);
-
-  // Trouver le nœud qui porte la liste de capteurs
   const sensorsNode = findSensorsNode(parsed) || parsed;
 
   const devices = [];
 
-  // Attributs racine (centrale d'alarme) éventuels
+  // ALARM PANEL depuis root
   const panelName = sensorsNode?.name;
   const panelModel = sensorsNode?.model_type || sensorsNode?.model || sensorsNode?.type;
   const panelMode = (sensorsNode?.alarm_mode || sensorsNode?.mode || "").toUpperCase();
@@ -135,21 +194,16 @@ function parseDevices(xml) {
     : (sensorsNode?.Sensor ? [sensorsNode.Sensor] : []);
 
   for (const s of list) {
-    // Copier attributs/props de base
-    const dev = {
-      ...s,
-      sensorValues: null
-    };
+    const dev = { ...s, sensorValues: null };
 
-    // Normalisation des champs texte courants (si imbriqués en sous-objets)
+    // normaliser champs texte imbriqués
     for (const key of ["deviceType","deviceModel","deviceVersion","name","long_name","batteryLevel","signalLevel","status","categories"]) {
       const v = s?.[key];
       if (v && typeof v === "object" && "#text" in v) dev[key] = String(v["#text"]);
     }
 
-    // Normaliser sensorValue(s)
+    // sensorValues
     const sv = {};
-    // cas 1: s.sensorValue (array/obj)
     const svRaw = s?.sensorValue;
     if (svRaw) {
       const arr = Array.isArray(svRaw) ? svRaw : [svRaw];
@@ -161,7 +215,6 @@ function parseDevices(xml) {
         sv[name] = { value: val, attrs };
       }
     }
-    // cas 2: s.sensorValues (rare)
     const svObj = s?.sensorValues;
     if (svObj && typeof svObj === "object") {
       for (const k of Object.keys(svObj)) {
@@ -180,13 +233,28 @@ function parseDevices(xml) {
   return devices;
 }
 
-// API principale (exportée)
+// API principale
 async function getDevices({ user, pass }) {
   const client = makeClient();
+
+  // 1) amorcer cookies
+  await getLoginPage(client);
+
+  // 2) SSO avec retry
   const token = await postSSO(client, user, pass);
+
+  // 3) soumettre formulaire final
   await submitFinalForm(client, token, user);
-  const xml = await fetchMySensorsXML(client);
-  return parseDevices(xml);
+
+  // 4) récupérer mysensors
+  try {
+    const xml = await fetchMySensorsXML(client);
+    return parseDevices(xml);
+  } catch (e) {
+    const status = e.response?.status;
+    const snippet = (e.response?.data ? (typeof e.response.data === "string" ? e.response.data : JSON.stringify(e.response.data)) : "").slice(0, 200);
+    throw new Error(`/mysensors échoué${status ? " ("+status+")" : ""}${snippet ? " — "+snippet : ""}`);
+  }
 }
 
 module.exports = { getDevices };
