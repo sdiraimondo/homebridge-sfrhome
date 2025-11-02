@@ -1,7 +1,7 @@
 {
   "name": "homebridge-sfrhome",
-  "version": "1.0.0",
-  "description": "Expose SFR HOME devices to HomeKit via Homebridge (full Node.js: SSO + mysensors + XML parsing)",
+  "version": "0.3.1",
+  "description": "Expose SFR HOME devices to HomeKit via Homebridge using devices.json (read + optional write via local control API)",
   "main": "index.js",
   "keywords": [
     "homebridge-plugin",
@@ -14,13 +14,7 @@
     "homebridge": ">=1.6.0"
   },
   "license": "MIT",
-  "dependencies": {
-    "axios": "^1.7.7",
-    "axios-cookiejar-support": "^4.0.6",
-    "cheerio": "^1.0.0",
-    "fast-xml-parser": "^4.5.0",
-    "tough-cookie": "^4.1.4"
-  },
+  "dependencies": {},
   "peerDependencies": {
     "homebridge": ">=1.6.0"
   }
