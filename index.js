@@ -1,10 +1,11 @@
 // homebridge-sfrhome / index.js
-// v0.3.1-p2 — Base 0.3.1, SANS fusion, avec normalisation du batteryLevel :
-// - 0..10 => *10 (ex: 3 => 30%)
-// - 255, -2, -1 => ignoré
-// - Status LOW_BAT => flag low battery si aucun niveau fiable
-// - Pas d'accessoire "* Battery" (ton JSON n'en contient pas, donc pas de doublons)
-// - Reste identique à 0.3.1 (catégories, services, lecture On/Off)
+// v0.3.1-p3 — Base 0.3.1, SANS fusion, batterie corrigée :
+// - Batterie = sensorValues.Battery (%) prioritaire
+// - Sinon batteryLevel (échelle 1..10) => *10
+// - Sentinelles (255, -1, -2) ignorées
+// - LOW_BAT => flag batterie faible si aucun % fiable
+// - Pas de custom pour signalLevel (resté interne)
+// - Écriture optionnelle via API locale (enableWrite/controlPort)
 
 let hap;
 const PLUGIN_NAME = "homebridge-sfrhome";
@@ -113,6 +114,9 @@ class SFRHomePlatform {
     return null;
   }
 
+  // --- Batterie : extraction corrigée ---
+  _clampPct(x) { return Math.max(0, Math.min(100, Number(x))); }
+
   _extractPercentFromString(str) {
     if (typeof str !== "string") return null;
     const m = str.match(/(\d+(?:\.\d+)?)\s*%/);
@@ -130,6 +134,15 @@ class SFRHomePlatform {
 
   _extractBatteryPercentFromSV(sv) {
     if (!sv) return null;
+    // d’abord clés typées Battery
+    for (const k of Object.keys(sv)) {
+      if (/^battery(level)?$/i.test(k)) {
+        const v = sv[k]?.value;
+        const n = this._extractPercentFromString(String(v ?? ""));
+        if (n !== null) return n;
+      }
+    }
+    // sinon, tente toutes les valeurs
     for (const k of Object.keys(sv)) {
       const v = sv[k]?.value;
       const n = this._extractPercentFromString(String(v ?? ""));
@@ -138,39 +151,39 @@ class SFRHomePlatform {
     return null;
   }
 
-  _extractBatteryNormalized(d) {
-    // 1) top-level
-    const raw = d.batteryLevel !== undefined ? parseInt(String(d.batteryLevel), 10) : null;
-    if (raw !== null && !isNaN(raw)) {
-      if (raw === 255 || raw === -2 || raw === -1) {
-        // secteur / inconnu
-        // ne retourne pas de niveau (mais on pourra poser un flag low via status)
-      } else if (raw >= 0 && raw <= 10) {
-        return Math.max(0, Math.min(100, raw * 10)); // échelle /10 -> %
-      } else if (raw >= 0 && raw <= 100) {
-        return raw;
-      }
-    }
-    // 2) sinon, tenter un % dans sensorValues (au cas où)
-    const svPercent = this._extractBatteryPercentFromSV(d.sensorValues);
-    if (svPercent !== null) return Math.max(0, Math.min(100, svPercent));
-
-    // rien de fiable
-    return null;
-  }
-
   _hasLowBatFlag(d) {
-    // LOW_BAT dans status
     if (String(d.status || "").toUpperCase() === "LOW_BAT") return true;
-    // certains devices exposent LowBattery/StatusLowBattery dans sensorValues (peu probable ici)
     const sv = d.sensorValues || {};
     for (const k of Object.keys(sv)) {
       if (/statuslowbattery|lowbattery|batterylow/i.test(k)) {
         const s = String(sv[k].value).trim().toLowerCase();
         if (["1","true","yes","low"].includes(s)) return true;
+        if (["0","false","no","ok","normal"].includes(s)) return false;
       }
     }
     return false;
+  }
+
+  _extractBatteryNormalized(d) {
+    // 1) % explicite dans sensorValues → prioritaire
+    const fromSV = this._extractBatteryPercentFromSV(d.sensorValues);
+    if (fromSV !== null) return this._clampPct(fromSV);
+
+    // 2) Échelle 1..10 via batteryLevel (vraie batterie pour certains devices)
+    if (d.batteryLevel !== undefined && d.batteryLevel !== null) {
+      const raw = Number(d.batteryLevel);
+      if (Number.isFinite(raw)) {
+        // sentinelles à ignorer
+        if (raw === 255 || raw === -1 || raw === -2) return null;
+        // 1..10 => %
+        if (raw >= 1 && raw <= 10) return this._clampPct(raw * 10);
+        // (rare) déjà en %
+        if (raw >= 0 && raw <= 100) return this._clampPct(raw);
+      }
+    }
+
+    // 3) Rien de quantifiable
+    return null;
   }
 
   // ---------- Cycle principal (0.3.1 sans fusion) ----------
@@ -280,13 +293,13 @@ class SFRHomePlatform {
     }
 
     // BatteryService si pertinent (normalisé)
-    const level = this._extractBatteryNormalized(d); // 0..10 → *10, 255/-2/-1 ignoré
+    const level = this._extractBatteryNormalized(d); // % si dispo, sinon 1..10 → ×10
     const lowFlag = this._hasLowBatFlag(d);
 
     if (level !== null || lowFlag) {
       const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
-      const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
-      batt.setCharacteristic(Characteristic.BatteryLevel, Math.max(0, Math.min(100, finalLevel)));
+      const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100); // indicatif si pas de %
+      batt.setCharacteristic(Characteristic.BatteryLevel, this._clampPct(finalLevel));
       batt.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
       batt.setCharacteristic(
         Characteristic.StatusLowBattery,
