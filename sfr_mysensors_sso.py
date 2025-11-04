@@ -1,160 +1,348 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+sfr_mysensors_sso.py — SFR Home : SSO robuste + soumission du formulaire final (token_sso)
++ récupération /mysensors + parsing XML -> devices.json + devices.csv
++ ajout d'un device synthétique "Centrale d'alarme" (ALARM_PANEL) depuis les attributs root:
+  name="Centrale", model_type="TSC06SFR", alarm_mode="ON|OFF|CUSTOM"
 
-import requests
-from bs4 import BeautifulSoup
-import lxml.etree as ET
+Dépendances :
+    pip install requests lxml beautifulsoup4
+
+Exemples :
+    python sfr_mysensors_sso.py --user ton.email@exemple        # mot de passe demandé en caché
+    python sfr_mysensors_sso.py --user ton.email@exemple --password 'TonMDP'
+    python sfr_mysensors_sso.py --cookie 'PHPSESSID=xxx; ...'   # utilise un cookie déjà authentifié
+    python sfr_mysensors_sso.py --use-local                     # parse un XML local pour tests
+"""
+
+import os
+import sys
 import json
 import csv
 import argparse
-import sys
-import os
+import getpass
+import requests
+from bs4 import BeautifulSoup
+from lxml import etree
+from io import BytesIO
+from urllib.parse import urljoin
 
-# --------------------------------------------------------------------------------------
-# CONFIG PAR DÉFAUT
-# --------------------------------------------------------------------------------------
-BASE_URL = "https://home.sfr.fr"
-LOGIN_URL = f"{BASE_URL}/login"
-SSO_CONNECTOR_URL = f"{BASE_URL}/sso-connector.php"
-MYSENSORS_URL = f"{BASE_URL}/mysensors"
+# ---------- valeurs par défaut ----------
+BASE_URL_DEFAULT = "https://home.sfr.fr/"
+LOGIN_URL_DEFAULT = "https://home.sfr.fr/login"
+DASHBOARD_URL_DEFAULT = "https://home.sfr.fr/"   # page d'atterrissage
+SSO_ENDPOINT = "sso-connector.php"
+MYSENSORS_URL_DEFAULT = "https://home.sfr.fr/mysensors"
+LOCAL_XML_PATH = "/mnt/data/mysensors.xml"
+OUTPUT_JSON = "/tmp/devices.json"
+OUTPUT_CSV = "/tmp/devices.csv"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64)",
-}
-
-# --------------------------------------------------------------------------------------
-# ARGUMENTS
-# --------------------------------------------------------------------------------------
+# ---------- arguments ----------
 def parse_args():
-    p = argparse.ArgumentParser(description="SFR Home mysensors fetcher (via SSO)")
-    p.add_argument("--user", required=True, help="Nom d'utilisateur SFR (email)")
-    p.add_argument("--password", required=True, help="Mot de passe SFR")
-    p.add_argument("--output-json", dest="output_json", help="Fichier JSON de sortie", default="devices.json")
-    p.add_argument("--output-csv", dest="output_csv", help="Fichier CSV de sortie", default="devices.csv")
-    p.add_argument("--debug", action="store_true", help="Activer les fichiers debug HTML")
+    p = argparse.ArgumentParser(description="SFR Home: login SSO + fetch mysensors (robust)")
+    p.add_argument("--user","-u", help="Identifiant / email SFR")
+    p.add_argument("--password","-p", help="Mot de passe (sinon, saisie cachée)")
+    p.add_argument("--cookie","-c", help="Chaîne Cookie (si fournie, login non utilisé)")
+    p.add_argument("--use-local", action="store_true", help=f"Utiliser {LOCAL_XML_PATH} au lieu du réseau")
+    p.add_argument("--base-url", default=BASE_URL_DEFAULT)
+    p.add_argument("--login-url", default=LOGIN_URL_DEFAULT)
+    p.add_argument("--dashboard-url", default=DASHBOARD_URL_DEFAULT)
+    p.add_argument("--mysensors-url", default=MYSENSORS_URL_DEFAULT)
     return p.parse_args()
 
-# --------------------------------------------------------------------------------------
-# PARSE XML DES CAPTEURS
-# --------------------------------------------------------------------------------------
-def parse_sensors_xml(xml_text):
+# ---------- parsing XML (avec ALARM_PANEL) ----------
+def parse_sensors_xml(xml_bytes):
+    """
+    Parse le XML /mysensors et retourne une liste de devices.
+    - Convertit _Attrib en dict standard
+    - Ajoute un device synthétique "Centrale d'alarme" (ALARM_PANEL) si
+      des attributs root name/model_type/alarm_mode sont présents.
+    """
+    parser = etree.XMLParser(recover=True, encoding='utf-8')
+    root = etree.parse(BytesIO(xml_bytes), parser).getroot()
     devices = []
-    try:
-        root = ET.fromstring(xml_text.encode("utf-8"))
-    except ET.XMLSyntaxError:
-        print("[!] Erreur : XML illisible ou incomplet.")
-        return devices
 
-    for el in root.findall(".//device"):
-        dev = el.attrib.copy()
-        sv = {}
-        for sv_el in el.findall(".//sensorValue"):
-            name = sv_el.get("name") or sv_el.get("type") or "unknown"
-            val = sv_el.text or ""
-            sv[name] = {"value": val, "attrs": dict(sv_el.attrib)}
-        dev["sensorValues"] = sv
-        devices.append(dev)
-
-    # Ajouter la centrale d’alarme si présente sur la première ligne XML
-    root_attrs = root.attrib
-    if "name" in root_attrs and "model_type" in root_attrs and "alarm_mode" in root_attrs:
-        centrale = {
-            "name": root_attrs["name"],
-            "model_type": root_attrs["model_type"],
-            "alarm_mode": root_attrs["alarm_mode"],
+    # 0) Centrale d'alarme depuis les attributs du root (si présents)
+    #    Ex: name="Centrale" model_type="TSC06SFR" alarm_mode="ON|OFF|CUSTOM"
+    root_name = root.attrib.get("name") or root.attrib.get("panel_name") or root.attrib.get("hub_name")
+    root_model = root.attrib.get("model_type") or root.attrib.get("model") or root.attrib.get("type")
+    root_mode = root.attrib.get("alarm_mode") or root.attrib.get("mode")  # ON / OFF / CUSTOM
+    if root_name or root_model or root_mode:
+        panel = {
+            "id": "panel",                # id fixe stable
+            "rrd_id": "-1",
+            "nameable": "1",
+            "brand": "SFR HOME",
+            "zone": "-1",
+            "group": "-1",
+            "testable": "0",
+            "deviceType": "ALARM_PANEL",
+            "deviceModel": root_model or "",
+            "deviceVersion": "1.0",
+            "name": root_name or "Centrale",
+            "long_name": f"Centrale d'alarme ({root_model})" if root_model else "Centrale d'alarme",
+            "batteryLevel": "-2",
+            "signalLevel": "-2",
+            "status": (root_mode or "UNKNOWN").upper(),
+            "categories": "alarm",
             "sensorValues": {
-                "alarm_mode": {"value": root_attrs["alarm_mode"]}
-            },
+                "AlarmMode": {
+                    "value": root_mode or "",
+                    "attrs": {"name": "AlarmMode"}
+                }
+            }
         }
-        devices.append(centrale)
+        devices.append(panel)
+
+    # 1) Capteurs / actionneurs du XML
+    for s in root.findall(".//Sensor"):
+        dev = dict(s.attrib)  # attributs du <Sensor>
+
+        # champs texte courants
+        for tag in ("deviceType","deviceModel","deviceVersion","name","long_name",
+                    "batteryLevel","signalLevel","status","categories"):
+            el = s.find(tag)
+            dev[tag] = el.text.strip() if (el is not None and el.text) else None
+
+        # sensorValues
+        sv = {}
+        for sv_el in s.findall(".//sensorValue"):
+            name = sv_el.get("name") or sv_el.attrib.get("name") or sv_el.get("id")
+            if not name:
+                name = f"value_{len(sv)+1}"
+            val = (sv_el.text or "").strip()
+            attrs = dict(sv_el.attrib)  # convertir en dict standard
+            if name in sv:
+                # éviter les collisions de noms
+                idx = 2
+                while f"{name}_{idx}" in sv:
+                    idx += 1
+                name = f"{name}_{idx}"
+            sv[name] = {"value": val, "attrs": attrs}
+
+        dev["sensorValues"] = sv or None
+        devices.append(dev)
 
     return devices
 
-# --------------------------------------------------------------------------------------
-# EXPORT JSON / CSV
-# --------------------------------------------------------------------------------------
-def export_json(devices, filename):
+def save_outputs(devices):
+    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+        json.dump(devices, f, indent=2, ensure_ascii=False)
+
+    keys = ["id","deviceType","name","status","batteryLevel","signalLevel","categories"]
+    with open(OUTPUT_CSV, "w", newline='', encoding="utf-8") as csvf:
+        writer = csv.DictWriter(csvf, fieldnames=keys)
+        writer.writeheader()
+        for d in devices:
+            writer.writerow({k: d.get(k,"") for k in keys})
+    print(f"[+] Écrit {OUTPUT_JSON} et {OUTPUT_CSV}")
+
+# ---------- util debug ----------
+def dump_cookies(session, filename="debug_cookies.txt", prefix=""):
     try:
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(devices, f, ensure_ascii=False, indent=2)
-        print(f"[+] JSON écrit : {filename} ({len(devices)} devices)")
-    except Exception as e:
-        print(f"[!] Erreur d’écriture JSON : {e}")
+        with open(filename, "a", encoding="utf-8") as f:
+            f.write(f"{prefix}COOKIES:\n")
+            for c in session.cookies:
+                masked = (c.value[:6] + "...") if c.value else ""
+                f.write(f"  {c.domain}\t{c.path}\t{c.name}={masked}\n")
+            f.write("\n")
+    except Exception:
+        pass
 
-def export_csv(devices, filename):
+# ---------- SSO & formulaires ----------
+def post_sso(session, base_url, user, password):
+    url = urljoin(base_url, SSO_ENDPOINT)
+    data = {"connectionSFR": user, "passSFR": password}
+    headers = {
+        "Origin": base_url.rstrip("/"),
+        "Referer": urljoin(base_url, "login"),
+    }
+    r = session.post(url, data=data, headers=headers, timeout=20, allow_redirects=True)
+    r.raise_for_status()
     try:
-        with open(filename, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["name", "model_type", "status", "batteryLevel", "signalLevel", "alarm_mode"])
-            for d in devices:
-                writer.writerow([
-                    d.get("name"),
-                    d.get("model_type"),
-                    d.get("status"),
-                    d.get("batteryLevel"),
-                    d.get("signalLevel"),
-                    d.get("alarm_mode"),
-                ])
-        print(f"[+] CSV écrit : {filename}")
-    except Exception as e:
-        print(f"[!] Erreur d’écriture CSV : {e}")
+        return r.json()
+    except ValueError:
+        return {"raw_text": r.text}
 
-# --------------------------------------------------------------------------------------
-# CONNEXION SSO
-# --------------------------------------------------------------------------------------
-def connect_and_fetch(user, password, debug=False):
-    session = requests.Session()
-    session.headers.update(HEADERS)
+def submit_final_form(session, login_url, token_sso, user=None, password=None):
+    """
+    GET /login, trouver form (#loginForm / #login_form_add_rib), copier tous les inputs,
+    injecter token_sso (name attendu), forcer email et passwd si présents,
+    inclure le bouton submit s'il existe, POST vers l'action.
+    Écrit des fichiers debug_*.html et headers.
+    Retourne l'URL finale après submit.
+    """
+    r = session.get(login_url, headers={"Referer": login_url, "Accept":"text/html,*/*"}, timeout=20)
+    r.raise_for_status()
+    with open("debug_login_page.html","w",encoding="utf-8") as f:
+        f.write(r.text)
 
-    # Étape 1 : POST SSO
-    print("[*] Étape 1/4 — POST SSO")
-    resp1 = session.post(SSO_CONNECTOR_URL, data={"username": user, "password": password})
-    if resp1.status_code != 200:
-        print(f"[!] Erreur SSO : {resp1.status_code}")
-        return None
-    if debug:
-        open("debug_sso.html", "w").write(resp1.text)
+    soup = BeautifulSoup(r.text, "html.parser")
+    form = soup.find("form", {"id": "login_form_add_rib"}) or soup.find("form", {"id": "loginForm"})
+    if not form:
+        raise RuntimeError("Formulaire final (#loginForm / #login_form_add_rib) introuvable.")
 
-    # Étape 2 : login final
-    print("[*] Étape 2/4 — Soumission du formulaire final")
-    resp2 = session.get(LOGIN_URL)
-    if debug:
-        open("debug_login.html", "w").write(resp2.text)
+    action = form.get("action") or login_url
+    action_url = urljoin(login_url, action)
+    method = (form.get("method") or "post").lower()
 
-    # Étape 3 : tableau de bord
-    print("[*] Étape 3/4 — Ouverture du dashboard")
-    resp3 = session.get(f"{BASE_URL}/accueil")
-    if debug:
-        open("debug_dashboard.html", "w").write(resp3.text)
+    payload = {}
+    for inp in form.find_all("input"):
+        itype = (inp.get("type") or "").lower()
+        name = inp.get("name")
+        if not name:
+            continue
+        value = inp.get("value", "")
+        if itype == "checkbox" and not inp.has_attr("checked"):
+            continue
+        payload[name] = value
 
-    # Étape 4 : récupération des capteurs
-    print("[*] Étape 4/4 — Récupération mysensors")
-    resp4 = session.get(MYSENSORS_URL)
-    if resp4.status_code != 200:
-        print(f"[!] Échec mysensors : {resp4.status_code}")
-        if debug:
-            open("debug_mysensors_error.html", "w").write(resp4.text)
-        return None
-    return resp4.text
+    submit_btn = form.find("input", {"type": "submit"})
+    if submit_btn and submit_btn.get("name"):
+        payload[submit_btn["name"]] = submit_btn.get("value", "")
 
-# --------------------------------------------------------------------------------------
-# MAIN
-# --------------------------------------------------------------------------------------
+    payload["token_sso"] = token_sso
+
+    if user and "email" in payload and not payload.get("email"):
+        payload["email"] = user
+    if password and "passwd" in payload and not payload.get("passwd"):
+        payload["passwd"] = password
+
+    headers = {
+        "Origin": action_url.split("/login")[0],
+        "Referer": login_url,
+    }
+
+    dump_cookies(session, prefix="[AVANT SUBMIT] ")
+
+    if method == "post":
+        r2 = session.post(action_url, data=payload, headers=headers, timeout=20, allow_redirects=True)
+    else:
+        r2 = session.get(action_url, params=payload, headers=headers, timeout=20, allow_redirects=True)
+
+    with open("debug_after_submit.html","w",encoding="utf-8") as f:
+        f.write(r2.text)
+    try:
+        with open("debug_after_submit_headers.txt","w",encoding="utf-8") as f:
+            f.write(f"URL finale: {r2.url}\nStatus: {r2.status_code}\n\n=== HEADERS ===\n")
+            for k,v in r2.headers.items():
+                f.write(f"{k}: {v}\n")
+    except Exception:
+        pass
+
+    r2.raise_for_status()
+    dump_cookies(session, prefix="[APRES SUBMIT] ")
+    return r2.url
+
+def warm_up_dashboard(session, dashboard_url):
+    r = session.get(dashboard_url, headers={"Referer": dashboard_url}, timeout=20, allow_redirects=True)
+    with open("debug_dashboard.html","w",encoding="utf-8") as f:
+        f.write(r.text)
+    r.raise_for_status()
+    return r.url
+
+def fetch_mysensors(session, mysensors_url, referer):
+    headers = {
+        "Accept": "application/xml, text/xml, */*",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": referer,
+    }
+    r = session.get(mysensors_url, headers=headers, timeout=20, allow_redirects=True)
+    if r.status_code >= 400:
+        with open("debug_mysensors_error.html","wb") as f:
+            f.write(r.content or b"")
+    r.raise_for_status()
+    return r.content
+
+# ---------- main ----------
 def main():
     args = parse_args()
 
-    xml_text = connect_and_fetch(args.user, args.password, args.debug)
-    if not xml_text:
-        print("[!] Aucune donnée récupérée.")
+    # Mode local (test parsing)
+    if args.use_local:
+        if not os.path.exists(LOCAL_XML_PATH):
+            print(f"[!] Fichier local introuvable: {LOCAL_XML_PATH}")
+            sys.exit(1)
+        with open(LOCAL_XML_PATH, "rb") as f:
+            xml = f.read()
+        devices = parse_sensors_xml(xml)
+        print(f"[+] Parse local OK : {len(devices)} devices")
+        save_outputs(devices)
+        return
+
+    # Cookie direct ?
+    cookie_str = args.cookie or os.getenv("SFR_SESSION_COOKIE")
+    if cookie_str:
+        print("[*] Utilisation d’un cookie de session fourni")
+        session = requests.Session()
+        session.headers.update({"User-Agent":"Mozilla/5.0", "Accept":"*/*", "Cookie": cookie_str})
+        xml = fetch_mysensors(session, args.mysensors_url, referer=args.dashboard_url)
+        with open("mysensors_raw.xml","wb") as f:
+            f.write(xml)
+        print(f"[+] mysensors récupéré ({len(xml)} octets)")
+        devices = parse_sensors_xml(xml)
+        print(f"[+] Parse OK : {len(devices)} devices")
+        save_outputs(devices)
+        return
+
+    # SSO complet
+    user = args.user or os.getenv("SFR_USER")
+    if not user:
+        print("[!] Fournis --user ou SFR_USER.")
+        sys.exit(2)
+    password = args.password or getpass.getpass(prompt=f"Mot de passe pour {user}: ")
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent":"Mozilla/5.0",
+        "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+
+    print("[*] Étape 1/4 — POST SSO")
+    sso = post_sso(session, args.base_url, user, password)
+    token = None
+    if isinstance(sso, dict) and isinstance(sso.get("result"), dict):
+        token = sso["result"].get("token_sso")
+    if not token:
+        print("[!] token_sso manquant — flux peut avoir changé.")
+        with open("debug_sso.json","w",encoding="utf-8") as f:
+            f.write(json.dumps(sso, indent=2, ensure_ascii=False))
+        sys.exit(1)
+    print("  token_sso reçu.")
+
+    print("[*] Étape 2/4 — Soumission du formulaire final")
+    try:
+        final_url = submit_final_form(session, args.login_url, token, user=user, password=password)
+    except Exception as e:
+        print("[!] Échec soumission du formulaire final :", e)
+        print("    -> Consulte debug_login_page.html, debug_after_submit.html et debug_after_submit_headers.txt")
+        sys.exit(1)
+    print("  URL après submit:", final_url)
+
+    print("[*] Étape 3/4 — Ouverture du dashboard")
+    try:
+        dash_url = warm_up_dashboard(session, args.dashboard_url)
+    except Exception as e:
+        print("[!] Échec ouverture du dashboard :", e)
+        print("    -> Consulte debug_dashboard.html")
+        sys.exit(1)
+    print("  URL dashboard:", dash_url)
+
+    print("[*] Étape 4/4 — Récupération mysensors")
+    try:
+        xml = fetch_mysensors(session, args.mysensors_url, referer=dash_url or args.dashboard_url)
+        with open("mysensors_raw.xml","wb") as f:
+            f.write(xml)
+        print(f"[+] mysensors récupéré ({len(xml)} octets)")
+    except Exception as e:
+        print("[!] Échec mysensors :", e)
+        print("    -> Consulte debug_mysensors_error.html (et debug_cookies.txt) pour le contenu et l’état cookies.")
         sys.exit(1)
 
-    devices = parse_sensors_xml(xml_text)
+    devices = parse_sensors_xml(xml)
     print(f"[+] Parse OK : {len(devices)} devices")
+    save_outputs(devices)
 
-    # Export JSON & CSV
-    export_json(devices, args.output_json)
-    export_csv(devices, args.output_csv)
-
-# --------------------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
