@@ -251,6 +251,7 @@ class SFRHomePlatform {
       case "ALARM_PANEL":
       case "REMOTE":
       case "KEYPAD":
+      case "SOLAR_SIREN":
       case "SIREN":
         accessory.addService(Service.SecuritySystem, accessory.displayName);
         break;
@@ -409,3 +410,4 @@ class SFRHomePlatform {
     }
   }
 }
+
