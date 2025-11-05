@@ -1,12 +1,9 @@
 // homebridge-sfrhome / index.js
-// v0.3.1-p3 — Base 0.3.1, SANS fusion, batterie corrigée :
-// - Batterie = sensorValues.Battery (%) prioritaire
-// - Sinon batteryLevel (échelle 1..10) => *10
-// - Sentinelles (255, -1, -2) ignorées
-// - LOW_BAT => flag batterie faible si aucun % fiable
-// - REMOTE/KEYPAD/SIREN → SecuritySystem (ajout de ce commit)
-// - Pas de custom pour signalLevel (resté interne)
-// - Écriture optionnelle via API locale (enableWrite/controlPort)
+// v0.3.2 — Base 0.3.1 avec extensions :
+// ✅ Batterie corrigée
+// ✅ Devices "REMOTE" / "KEYPAD" / "SIREN" → SecuritySystem
+// ✅ Exclusion configurable (noms / modèles) via config.json
+// ✅ Lecture / écriture API locale facultative
 
 let hap;
 const PLUGIN_NAME = "homebridge-sfrhome";
@@ -25,6 +22,9 @@ class SFRHomePlatform {
     this.name = this.config.name || "SFR Home";
     this.devicesPath = this.config.devicesPath || "/path/vers/devices.json";
     this.refreshSeconds = Number(this.config.refreshSeconds || 60);
+
+    // Options d'exclusion (noms, modèles)
+    this.exclude = this.config.exclude || {};
 
     // Écriture (facultative) — API locale
     this.enableWrite = !!this.config.enableWrite;
@@ -170,32 +170,43 @@ class SFRHomePlatform {
     const fromSV = this._extractBatteryPercentFromSV(d.sensorValues);
     if (fromSV !== null) return this._clampPct(fromSV);
 
-    // 2) Échelle 1..10 via batteryLevel (vraie batterie pour certains devices)
+    // 2) Échelle 1..10 via batteryLevel
     if (d.batteryLevel !== undefined && d.batteryLevel !== null) {
       const raw = Number(d.batteryLevel);
       if (Number.isFinite(raw)) {
-        // sentinelles à ignorer
         if (raw === 255 || raw === -1 || raw === -2) return null;
-        // 1..10 => %
         if (raw >= 1 && raw <= 10) return this._clampPct(raw * 10);
-        // (rare) déjà en %
         if (raw >= 0 && raw <= 100) return this._clampPct(raw);
       }
     }
 
-    // 3) Rien de quantifiable
     return null;
   }
 
-  // ---------- Cycle principal (0.3.1 sans fusion) ----------
+  // ---------- Cycle principal ----------
   _reconcile(devices) {
     const seen = new Set();
 
+    const exclude = this.config.exclude || {};
+    const excludedNames = (exclude.names || []).map((x) => x.toLowerCase());
+    const excludedModels = (exclude.models || []).map((x) => x.toUpperCase());
+
     for (const d of devices) {
       const id = this._stableIdOf(d);
-      const name = (d.name || "").trim() || `${d.deviceType || "Device"} ${id}`;
-      const uuid = this.api.hap.uuid.generate(`sfrhome:${id}`);
+      const name = (d.name || "").trim();
 
+      // --- 🔥 Filtrage d'exclusion ---
+      if (excludedNames.includes(name.toLowerCase())) {
+        this.log.info(`[SFR Home] Périphérique exclu par nom : ${name}`);
+        continue;
+      }
+      if (excludedModels.includes((d.deviceType || "").toUpperCase()) ||
+          excludedModels.includes((d.model_type || "").toUpperCase())) {
+        this.log.info(`[SFR Home] Périphérique exclu par modèle : ${d.model_type || d.deviceType}`);
+        continue;
+      }
+
+      const uuid = this.api.hap.uuid.generate(`sfrhome:${id}`);
       seen.add(uuid);
 
       let accessory = this.accessories.get(uuid);
@@ -228,15 +239,14 @@ class SFRHomePlatform {
     }
   }
 
+  // ---------- Services ----------
   _setupServices(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
 
-    // Nettoyer services (sauf AccessoryInformation)
     accessory.services
       .filter((s) => !(s instanceof Service.AccessoryInformation))
       .forEach((s) => accessory.removeService(s));
 
-    // AccessoryInformation (0.3.1)
     const info = accessory.getService(Service.AccessoryInformation);
     const serialRaw = this._stableIdOf(d);
     const serial = serialRaw.length > 1 ? serialRaw : `${(d.deviceType || "DEV")}-sn`;
@@ -245,13 +255,10 @@ class SFRHomePlatform {
       .setCharacteristic(Characteristic.Model, d.deviceModel || d.deviceType || "Unknown")
       .setCharacteristic(Characteristic.SerialNumber, serial);
 
-    // Service principal (0.3.1 + mapping sécurité étendu)
     switch ((d.deviceType || "").toUpperCase()) {
-      // 🔒 Appareils de sécurité : panneau, télécommande, clavier, sirène
       case "ALARM_PANEL":
       case "REMOTE":
       case "KEYPAD":
-      case "SOLAR_SIREN":
       case "SIREN":
         accessory.addService(Service.SecuritySystem, accessory.displayName);
         break;
@@ -278,7 +285,6 @@ class SFRHomePlatform {
       case "LED_BULB_COLOR":
       case "ON_OFF_PLUG": {
         const svc = accessory.addService(Service.Lightbulb, accessory.displayName);
-        // ÉCRITURE optionnelle via API locale (0.3.1)
         svc.getCharacteristic(Characteristic.On)
           .onSet(async (value) => {
             if (!this.enableWrite) {
@@ -304,13 +310,11 @@ class SFRHomePlatform {
         accessory.addService(Service.MotionSensor, accessory.displayName);
     }
 
-    // BatteryService si pertinent (normalisé)
-    const level = this._extractBatteryNormalized(d); // % si dispo, sinon 1..10 → ×10
+    const level = this._extractBatteryNormalized(d);
     const lowFlag = this._hasLowBatFlag(d);
-
     if (level !== null || lowFlag) {
       const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
-      const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100); // indicatif si pas de %
+      const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
       batt.setCharacteristic(Characteristic.BatteryLevel, this._clampPct(finalLevel));
       batt.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
       batt.setCharacteristic(
@@ -322,12 +326,10 @@ class SFRHomePlatform {
     }
   }
 
+  // ---------- Mises à jour ----------
   _updateValues(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
-
-    const getSV = (name) =>
-      d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
-
+    const getSV = (name) => d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
     const status = (d.status || "").toUpperCase();
 
     if (["ALARM_PANEL","REMOTE","KEYPAD","SIREN"].includes((d.deviceType || "").toUpperCase())) {
@@ -404,10 +406,9 @@ class SFRHomePlatform {
       if (svc) {
         const reachable = status !== "UNREACHABLE";
         let on = this._findOnOffInSensorValues(d);
-        if (on === null) on = reachable; // fallback basique
+        if (on === null) on = reachable;
         svc.updateCharacteristic(Characteristic.On, !!on);
       }
     }
   }
 }
-
