@@ -1,9 +1,9 @@
 // homebridge-sfrhome / index.js
-// v0.3.2 — Base 0.3.1 avec extensions :
-// ✅ Batterie corrigée
-// ✅ Devices "REMOTE" / "KEYPAD" / "SIREN" → SecuritySystem
+// v0.3.3 — Extensions :
+// ✅ Batterie corrigée (% depuis sensorValues.Battery prioritaire, sinon batteryLevel 1..10 → ×10)
+// ✅ Devices "ALARM_PANEL", "REMOTE", "KEYPAD", "SIREN", "SOLAR_SIREN" → SecuritySystem
 // ✅ Exclusion configurable (noms / modèles) via config.json
-// ✅ Lecture / écriture API locale facultative
+// ✅ Déduplication des accessoires "Battery-only" : on fusionne le niveau de batterie et on ne crée pas de doublon
 
 let hap;
 const PLUGIN_NAME = "homebridge-sfrhome";
@@ -170,17 +170,48 @@ class SFRHomePlatform {
     const fromSV = this._extractBatteryPercentFromSV(d.sensorValues);
     if (fromSV !== null) return this._clampPct(fromSV);
 
-    // 2) Échelle 1..10 via batteryLevel
+    // 2) Échelle 1..10 via batteryLevel (vraie batterie pour certains devices)
     if (d.batteryLevel !== undefined && d.batteryLevel !== null) {
       const raw = Number(d.batteryLevel);
       if (Number.isFinite(raw)) {
+        // sentinelles à ignorer
         if (raw === 255 || raw === -1 || raw === -2) return null;
+        // 1..10 => %
         if (raw >= 1 && raw <= 10) return this._clampPct(raw * 10);
+        // (rare) déjà en %
         if (raw >= 0 && raw <= 100) return this._clampPct(raw);
       }
     }
 
+    // 3) Rien de quantifiable
     return null;
+  }
+
+  _isBatteryOnlyDevice(d) {
+    // Heuristiques légères :
+    // - nom se terminant par " Battery"
+    // - deviceType explicite "BATTERY"
+    // - sensorValues ne contenant QUE des infos batterie (% ou low battery)
+    const name = (d.name || "").trim();
+    if (/\sBattery$/i.test(name)) return true;
+
+    const dt = (d.deviceType || d.model_type || "").toUpperCase();
+    if (dt === "BATTERY" || dt === "BATTERY_SENSOR") return true;
+
+    const sv = d.sensorValues || {};
+    const keys = Object.keys(sv);
+    if (keys.length > 0) {
+      const onlyBatteryish = keys.every(k => /battery|statuslowbattery|lowbattery/i.test(k));
+      if (onlyBatteryish) return true;
+    }
+    return false;
+  }
+
+  _baseNameForBatteryCompanion(d) {
+    // "Cuisine Battery" -> "Cuisine"
+    const name = (d.name || "").trim();
+    const m = name.match(/^(.*)\s+Battery$/i);
+    return m ? m[1].trim() : name;
   }
 
   // ---------- Cycle principal ----------
@@ -191,11 +222,37 @@ class SFRHomePlatform {
     const excludedNames = (exclude.names || []).map((x) => x.toLowerCase());
     const excludedModels = (exclude.models || []).map((x) => x.toUpperCase());
 
+    // 1) Pré-passe : collecter les niveaux de batterie des "Battery-only" et ne pas les créer
+    const batteryOverrideByBaseName = new Map();
+    const batteryOnlyNames = new Set();
+
+    for (const d of devices) {
+      const name = (d.name || "").trim();
+      if (excludedNames.includes(name.toLowerCase())) continue;
+      if (excludedModels.includes((d.deviceType || "").toUpperCase()) ||
+          excludedModels.includes((d.model_type || "").toUpperCase())) continue;
+
+      if (this._isBatteryOnlyDevice(d)) {
+        const baseName = this._baseNameForBatteryCompanion(d);
+        const level = this._extractBatteryNormalized(d);
+        if (level !== null) {
+          batteryOverrideByBaseName.set(baseName.toLowerCase(), level);
+          batteryOnlyNames.add(name);
+          this.log.info(`[SFR Home] Détection compagnon batterie: "${name}" → fusion dans "${baseName}" (${level}%)`);
+        } else {
+          // même sans % exploitable, on évite de créer un doublon inutile
+          batteryOnlyNames.add(name);
+          this.log.info(`[SFR Home] Détection compagnon batterie (sans %) : "${name}" → ignoré`);
+        }
+      }
+    }
+
+    // 2) Création/MAJ des accessoires (en fusionnant si override trouvé)
     for (const d of devices) {
       const id = this._stableIdOf(d);
       const name = (d.name || "").trim();
 
-      // --- 🔥 Filtrage d'exclusion ---
+      // --- 🔥 Filtrage d'exclusion explicite ---
       if (excludedNames.includes(name.toLowerCase())) {
         this.log.info(`[SFR Home] Périphérique exclu par nom : ${name}`);
         continue;
@@ -204,6 +261,19 @@ class SFRHomePlatform {
           excludedModels.includes((d.model_type || "").toUpperCase())) {
         this.log.info(`[SFR Home] Périphérique exclu par modèle : ${d.model_type || d.deviceType}`);
         continue;
+      }
+
+      // --- 🔥 Ignorer les compagnons "Battery-only" (doublons)
+      if (batteryOnlyNames.has(name)) {
+        this.log.info(`[SFR Home] Ignoré (battery-only) : ${name}`);
+        continue;
+      }
+
+      // Appliquer un override si un compagnon a été détecté
+      const override = batteryOverrideByBaseName.get(name.toLowerCase());
+      if (override !== undefined) {
+        // On n’écrase PAS les données originales ; on annote l’objet pour la phase services
+        d.__batteryOverridePercent = override;
       }
 
       const uuid = this.api.hap.uuid.generate(`sfrhome:${id}`);
@@ -225,7 +295,7 @@ class SFRHomePlatform {
       this._updateValues(accessory, d);
     }
 
-    // retirer ceux qui n'existent plus
+    // 3) retirer ceux qui n'existent plus
     const toRemove = [];
     for (const [uuid, acc] of this.accessories.entries()) {
       if (!seen.has(uuid)) {
@@ -259,8 +329,8 @@ class SFRHomePlatform {
       case "ALARM_PANEL":
       case "REMOTE":
       case "KEYPAD":
-      case "SOLAR_SIREN":
       case "SIREN":
+      case "SOLAR_SIREN":
         accessory.addService(Service.SecuritySystem, accessory.displayName);
         break;
 
@@ -311,8 +381,10 @@ class SFRHomePlatform {
         accessory.addService(Service.MotionSensor, accessory.displayName);
     }
 
-    const level = this._extractBatteryNormalized(d);
+    // BatteryService : appliquer override si présent
+    let level = (d.__batteryOverridePercent !== undefined) ? d.__batteryOverridePercent : this._extractBatteryNormalized(d);
     const lowFlag = this._hasLowBatFlag(d);
+
     if (level !== null || lowFlag) {
       const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
       const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
@@ -333,7 +405,7 @@ class SFRHomePlatform {
     const getSV = (name) => d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
     const status = (d.status || "").toUpperCase();
 
-    if (["ALARM_PANEL","REMOTE","KEYPAD","SIREN"].includes((d.deviceType || "").toUpperCase())) {
+    if (["ALARM_PANEL","REMOTE","KEYPAD","SIREN","SOLAR_SIREN"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.SecuritySystem);
       if (svc) {
         const modeRaw = ((status || getSV("AlarmMode") || "") + "").toUpperCase();
@@ -413,4 +485,3 @@ class SFRHomePlatform {
     }
   }
 }
-
