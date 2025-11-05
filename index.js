@@ -4,6 +4,7 @@
 // - Sinon batteryLevel (échelle 1..10) => *10
 // - Sentinelles (255, -1, -2) ignorées
 // - LOW_BAT => flag batterie faible si aucun % fiable
+// - REMOTE/KEYPAD/SIREN → SecuritySystem (ajout de ce commit)
 // - Pas de custom pour signalLevel (resté interne)
 // - Écriture optionnelle via API locale (enableWrite/controlPort)
 
@@ -244,24 +245,33 @@ class SFRHomePlatform {
       .setCharacteristic(Characteristic.Model, d.deviceModel || d.deviceType || "Unknown")
       .setCharacteristic(Characteristic.SerialNumber, serial);
 
-    // Service principal (0.3.1)
+    // Service principal (0.3.1 + mapping sécurité étendu)
     switch ((d.deviceType || "").toUpperCase()) {
+      // 🔒 Appareils de sécurité : panneau, télécommande, clavier, sirène
       case "ALARM_PANEL":
+      case "REMOTE":
+      case "KEYPAD":
+      case "SIREN":
         accessory.addService(Service.SecuritySystem, accessory.displayName);
         break;
+
       case "MAGNETIC":
         accessory.addService(Service.ContactSensor, accessory.displayName);
         break;
+
       case "PIR_DETECTOR":
         accessory.addService(Service.MotionSensor, accessory.displayName);
         break;
+
       case "SMOKE":
         accessory.addService(Service.SmokeSensor, accessory.displayName);
         break;
+
       case "TEMP_HUM":
         accessory.addService(Service.TemperatureSensor, accessory.displayName + " Temp");
         accessory.addService(Service.HumiditySensor, accessory.displayName + " Hum");
         break;
+
       case "LED_BULB_DIMMER":
       case "LED_BULB_HUE":
       case "LED_BULB_COLOR":
@@ -288,6 +298,7 @@ class SFRHomePlatform {
           });
         break;
       }
+
       default:
         accessory.addService(Service.MotionSensor, accessory.displayName);
     }
@@ -318,7 +329,7 @@ class SFRHomePlatform {
 
     const status = (d.status || "").toUpperCase();
 
-    if ((d.deviceType || "").toUpperCase() === "ALARM_PANEL") {
+    if (["ALARM_PANEL","REMOTE","KEYPAD","SIREN"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.SecuritySystem);
       if (svc) {
         const modeRaw = ((status || getSV("AlarmMode") || "") + "").toUpperCase();
