@@ -406,13 +406,12 @@ class SFRHomePlatform {
         if (!isNaN(n)) hSvc.updateCharacteristic(Characteristic.CurrentRelativeHumidity, n);
       }
     }
-    
-    case "CAMERA_WIFI":
+	  
+    if ((d.deviceType || "").toUpperCase() === "CAMERA_WIFI") {
         accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
         break;	  	  
-	  
-	  case "ON_OFF_PLUG":
-	  case "SHUTTER_COMMAND":
+
+    if (["ON_OFF_PLUG","SHUTTER_COMMAND"].includes((d.deviceType || "").toUpperCase())) {
         accessory.addService(Service.SmokeSensor, accessory.displayName);
         break;	  
     
@@ -427,4 +426,3 @@ class SFRHomePlatform {
     }
   }
 }
-
