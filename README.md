@@ -17,7 +17,7 @@ A venir :
 - Pilotage des devices via API flask
 - Flux Camera
 
-## Installation (dev local)
+## Installation
 ```bash
 # Install des dépendances (selon votre distribution)
 pip install requests lxml beautifulsoup4
