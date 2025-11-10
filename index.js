@@ -81,10 +81,10 @@ class SFRHomePlatform {
       case "PIR_DETECTOR": return c.SENSOR;
       case "SMOKE": return c.SENSOR;
       case "TEMP_HUM": return c.SENSOR;
-      case "LED_BULB_DIMMER":
-      case "LED_BULB_HUE":
-      case "LED_BULB_COLOR":
-      case "ON_OFF_PLUG": return c.LIGHTBULB;
+      case "LED_BULB_DIMMER": return c.LIGHTBULB;
+      case "LED_BULB_HUE": return c.LIGHTBULB;
+      case "LED_BULB_COLOR": return c.LIGHTBULB;
+      case "ON_OFF_PLUG": return c.SWITCH;
       default: return c.OTHER;
     }
   }
@@ -485,3 +485,4 @@ class SFRHomePlatform {
     }
   }
 }
+
