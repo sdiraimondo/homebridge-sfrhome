@@ -329,7 +329,7 @@ class SFRHomePlatform {
     let level = (d.__batteryOverridePercent !== undefined) ? d.__batteryOverridePercent : this._extractBatteryNormalized(d);
     const lowFlag = this._hasLowBatFlag(d);
     if (level !== null || lowFlag) {
-      #const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
+      // const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
       const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
       info.setCharacteristic(Characteristic.BatteryLevel, this._clampPct(finalLevel));
       info.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
@@ -491,5 +491,6 @@ class SFRHomePlatform {
     }
   }
 }
+
 
 
