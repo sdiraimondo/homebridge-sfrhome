@@ -101,7 +101,7 @@ def parse_sensors_xml(xml_bytes):
 
         # champs texte courants
         for tag in ("deviceType","deviceModel","deviceVersion","name","long_name",
-                    "batteryLevel","signalLevel","status","categories"):
+                    "batteryLevel","deviceMac", "signalLevel","status","categories"):
             el = s.find(tag)
             dev[tag] = el.text.strip() if (el is not None and el.text) else None
 
@@ -130,7 +130,7 @@ def save_outputs(devices):
     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
         json.dump(devices, f, indent=2, ensure_ascii=False)
 
-    keys = ["id","deviceType","name","status","batteryLevel","signalLevel","categories"]
+    keys = ["id","deviceType","name","status","batteryLevel","deviceMac", "signalLevel","categories"]
     with open(OUTPUT_CSV, "w", newline='', encoding="utf-8") as csvf:
         writer = csv.DictWriter(csvf, fieldnames=keys)
         writer.writeheader()
