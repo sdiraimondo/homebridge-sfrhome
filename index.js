@@ -89,7 +89,7 @@ class SFRHomePlatform {
       case "LED_BULB_DIMMER": return c.LIGHTBULB;
       case "LED_BULB_HUE": return c.LIGHTBULB;
       case "LED_BULB_COLOR": return c.LIGHTBULB;
-      case "WIFI_CAMERA": return c.CAMERA;
+      case "CAMERA_WIFI": return c.CAMERA;
       case "ON_OFF_PLUG": return c.SWITCH;
       case "SHUTTER_COMMAND": return c.SWITCH;
       default: return c.OTHER;
@@ -427,3 +427,4 @@ class SFRHomePlatform {
     }
   }
 }
+
