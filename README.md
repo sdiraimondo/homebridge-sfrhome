@@ -1,6 +1,7 @@
-# homebridge-sfrhome
+# SFR Home pour Homebridge
 
 Plugin Homebridge exposant les équipements **SFR HOME** à HomeKit via scrapping du site SFR Home (script Python).
+Ne fonctionne pour l'instant qu'avec un abonnement SFR Home.
 
 ## Fonctionnement
 - Scrapping du site home.sfr.fr toutes les 2 minutes (via script python) et traitement en local
@@ -10,6 +11,7 @@ Plugin Homebridge exposant les équipements **SFR HOME** à HomeKit via scrappin
 - Récupération des périphériques SFR Home (contact, mouvement, fumée, température, humidité, ...) et des partenaires Hue, Legrand ou Netamo
 - Récupération du statut de l'alarme dans un device spécifique (Centrale)
 - Exclusion de certains périphériques par nom ou par type (Météo, Hue…) dans le fichier config.json
+- Création d'une version alternative sans abonnement
 
 A venir :
 - Pilotage des devices via API flask
