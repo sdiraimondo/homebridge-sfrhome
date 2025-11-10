@@ -342,7 +342,7 @@ class SFRHomePlatform {
     }
 
     switch ((d.deviceType || "").toUpperCase()) {
-      case "ALARM_PANEL"
+      case "ALARM_PANEL":
       case "REMOTE":
       case "KEYPAD":
       case "SIREN":
@@ -491,6 +491,7 @@ class SFRHomePlatform {
     }
   }
 }
+
 
 
 
