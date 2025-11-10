@@ -255,22 +255,6 @@ class SFRHomePlatform {
       .setCharacteristic(Characteristic.Model, d.deviceModel || d.deviceType || "Unknown")
       .setCharacteristic(Characteristic.SerialNumber, serial);
 
-    // BatteryService : appliquer override si présent
-    let level = (d.__batteryOverridePercent !== undefined) ? d.__batteryOverridePercent : this._extractBatteryNormalized(d);
-    const lowFlag = this._hasLowBatFlag(d);
-    if (level !== null || lowFlag) {
-      const batt = accessory.addService(Service.BatteryService, accessory.displayName + " (Battery)");
-      const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
-      batt.setCharacteristic(Characteristic.BatteryLevel, this._clampPct(finalLevel));
-      batt.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
-      batt.setCharacteristic(
-        Characteristic.StatusLowBattery,
-        (level !== null ? (level <= 20) : lowFlag)
-          ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
-          : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
-      );
-    }
-
     switch ((d.deviceType || "").toUpperCase()) {
       case "ALARM_PANEL":
         accessory.addService(Service.AccessCode, accessory.displayName);
@@ -317,6 +301,21 @@ class SFRHomePlatform {
 
       default:
         accessory.addService(Service.MotionSensor, accessory.displayName);
+    }
+
+    const level = this._extractBatteryNormalized(d);
+    const lowFlag = this._hasLowBatFlag(d);
+    if (level !== null || lowFlag) {
+      const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
+      const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
+      batt.setCharacteristic(Characteristic.BatteryLevel, this._clampPct(finalLevel));
+      batt.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
+      batt.setCharacteristic(
+        Characteristic.StatusLowBattery,
+        (level !== null ? (level <= 20) : lowFlag)
+          ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+          : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
+      );
     }
   }
 
