@@ -325,8 +325,24 @@ class SFRHomePlatform {
       .setCharacteristic(Characteristic.Model, d.deviceModel || d.deviceType || "Unknown")
       .setCharacteristic(Characteristic.SerialNumber, serial);
 
+    // BatteryService : appliquer override si présent
+    let level = (d.__batteryOverridePercent !== undefined) ? d.__batteryOverridePercent : this._extractBatteryNormalized(d);
+    const lowFlag = this._hasLowBatFlag(d);
+    if (level !== null || lowFlag) {
+      #const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
+      const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
+      info.setCharacteristic(Characteristic.BatteryLevel, this._clampPct(finalLevel));
+      info.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
+      info.setCharacteristic(
+        Characteristic.StatusLowBattery,
+        (level !== null ? (level <= 20) : lowFlag)
+          ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+          : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
+      );
+    }
+
     switch ((d.deviceType || "").toUpperCase()) {
-      case "ALARM_PANEL":
+      case "ALARM_PANEL"
       case "REMOTE":
       case "KEYPAD":
       case "SIREN":
@@ -351,10 +367,17 @@ class SFRHomePlatform {
         accessory.addService(Service.HumiditySensor, accessory.displayName + " Hum");
         break;
 
+      case "CAMERA_WIFI":
+        accessory.addService(Service.Camera, accessory.displayName);
+        break;
+
+      case "ON_OFF_PLUG":
+        accessory.addService(Service.Switch, accessory.displayName);
+        break;
+
       case "LED_BULB_DIMMER":
       case "LED_BULB_HUE":
-      case "LED_BULB_COLOR":
-      case "ON_OFF_PLUG": {
+      case "LED_BULB_COLOR": {
         const svc = accessory.addService(Service.Lightbulb, accessory.displayName);
         svc.getCharacteristic(Characteristic.On)
           .onSet(async (value) => {
@@ -379,23 +402,6 @@ class SFRHomePlatform {
 
       default:
         accessory.addService(Service.MotionSensor, accessory.displayName);
-    }
-
-    // BatteryService : appliquer override si présent
-    let level = (d.__batteryOverridePercent !== undefined) ? d.__batteryOverridePercent : this._extractBatteryNormalized(d);
-    const lowFlag = this._hasLowBatFlag(d);
-
-    if (level !== null || lowFlag) {
-      const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
-      const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
-      batt.setCharacteristic(Characteristic.BatteryLevel, this._clampPct(finalLevel));
-      batt.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
-      batt.setCharacteristic(
-        Characteristic.StatusLowBattery,
-        (level !== null ? (level <= 20) : lowFlag)
-          ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
-          : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
-      );
     }
   }
 
@@ -474,7 +480,7 @@ class SFRHomePlatform {
       }
     }
 
-    if (["LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR","ON_OFF_PLUG"].includes((d.deviceType || "").toUpperCase())) {
+    if (["LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.Lightbulb);
       if (svc) {
         const reachable = status !== "UNREACHABLE";
@@ -485,4 +491,5 @@ class SFRHomePlatform {
     }
   }
 }
+
 
