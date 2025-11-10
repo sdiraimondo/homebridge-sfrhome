@@ -1,18 +1,16 @@
 // homebridge-sfrhome / index.js
-// v0.3.2 — Base 0.3.1 avec extensions :
-// ✅ Batterie corrigée
-// ✅ Devices "REMOTE" / "KEYPAD" / "SIREN" → SecuritySystem
-// ✅ Exclusion configurable (noms / modèles) via config.json
-// ✅ Lecture / écriture API locale facultative
+// v0.3.3
+
 
 let hap;
-const PLUGIN_NAME = "homebridge-sfrhome";
-const PLATFORM_NAME = "SFRHomePlatform";
+const PLUGIN_NAME = "SFR Home pour Homebridge";
+const PLATFORM_NAME = "SFR Home";
 
 module.exports = (api) => {
   hap = api.hap;
   api.registerPlatform(PLUGIN_NAME, PLATFORM_NAME, SFRHomePlatform);
 };
+
 
 class SFRHomePlatform {
   constructor(log, config, api) {
@@ -73,6 +71,7 @@ class SFRHomePlatform {
     });
   }
 
+
   // ---------- Helpers ----------
   _categoryFor(d) {
     const c = hap.Categories;
@@ -108,8 +107,9 @@ class SFRHomePlatform {
 
   _findOnOffInSensorValues(d) {
     const sv = d.sensorValues || {};
-    const candidates = ["state","power","on","switch","relay","onoff","status"];
-    for (const name of Object.keys(sv)) {
+    //const candidates = ["state","power","on","switch","relay","onoff","status"];
+    const candidates = ["status"];
+	for (const name of Object.keys(sv)) {
       const low = name.toLowerCase();
       if (candidates.includes(low)) {
         const val = sv[name].value;
@@ -122,7 +122,10 @@ class SFRHomePlatform {
     return null;
   }
 
-  // --- Batterie : extraction corrigée ---
+
+  // Batterie : Récupération de la valeur et normalisation de la valeur
+  // -------------------------------------------------------------------------------------------------------------
+  
   _clampPct(x) { return Math.max(0, Math.min(100, Number(x))); }
 
   _extractPercentFromString(str) {
@@ -190,7 +193,10 @@ class SFRHomePlatform {
     return null;
   }
 
-  // ---------- Cycle principal ----------
+
+  // Cycle principal d'ajout des devices
+  // -------------------------------------------------------------------------------------------------------------
+  
   _reconcile(devices) {
     const seen = new Set();
 
@@ -265,13 +271,13 @@ class SFRHomePlatform {
 
     switch ((d.deviceType || "").toUpperCase()) {
       case "ALARM_PANEL":
+        accessory.addService(Service.SecuritySystem, accessory.displayName);
+        break;
+		
       case "REMOTE":
       case "KEYPAD":
       case "SIREN":
       case "SOLAR_SIREN":
-        accessory.addService(Service.SecuritySystem, accessory.displayName);
-        break;
-
       case "MAGNETIC":
         accessory.addService(Service.ContactSensor, accessory.displayName);
         break;
@@ -313,7 +319,7 @@ class SFRHomePlatform {
     const level = this._extractBatteryNormalized(d);
     const lowFlag = this._hasLowBatFlag(d);
     if (level !== null || lowFlag) {
-      const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
+      const batt = accessory.addService(Service.BatteryService, accessory.displayName + " (Battery)");
       const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
       batt.setCharacteristic(Characteristic.BatteryLevel, this._clampPct(finalLevel));
       batt.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
@@ -334,7 +340,7 @@ class SFRHomePlatform {
     const status = (d.status || "").toUpperCase();
 
     // Devices de type Alarm : Clavier, télécommande, sirène
-    if (["ALARM_PANEL","REMOTE","KEYPAD","SIREN"].includes((d.deviceType || "").toUpperCase())) {
+    if ((d.deviceType || "").toUpperCase() === "ALARM_PANEL") {
       const svc = accessory.getService(Service.SecuritySystem);
       if (svc) {
         const modeRaw = ((status || getSV("AlarmMode") || "") + "").toUpperCase();
@@ -357,7 +363,7 @@ class SFRHomePlatform {
     }
 
     // Détecteur d'ouverture
-    if ((d.deviceType || "").toUpperCase() === "MAGNETIC") {
+    if (["MAGNETIC","REMOTE","KEYPAD","SOLAR_SIREN","SIREN"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.ContactSensor);
       if (svc) {
         const isOpen = status === "TRIGGERED" || status === "OPEN";
@@ -407,14 +413,17 @@ class SFRHomePlatform {
       }
     }
 	  
-    if ((d.deviceType || "").toUpperCase() === "CAMERA_WIFI") {
+    // Caméra Wifi
+	if ((d.deviceType || "").toUpperCase() === "CAMERA_WIFI") {
         accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
         break;	  	  
 
+    // Prise programmable + Commande volet Legrand
     if (["ON_OFF_PLUG","SHUTTER_COMMAND"].includes((d.deviceType || "").toUpperCase())) {
         accessory.addService(Service.SmokeSensor, accessory.displayName);
         break;	  
-    
+
+    // Lumières SFR + Hue    
     if (["LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.Lightbulb);
       if (svc) {
