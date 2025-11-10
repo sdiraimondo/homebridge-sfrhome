@@ -329,11 +329,11 @@ class SFRHomePlatform {
     let level = (d.__batteryOverridePercent !== undefined) ? d.__batteryOverridePercent : this._extractBatteryNormalized(d);
     const lowFlag = this._hasLowBatFlag(d);
     if (level !== null || lowFlag) {
-      // const batt = accessory.addService(Service.BatteryService, accessory.displayName + " Battery");
+      const batt = accessory.addService(Service.BatteryService, accessory.displayName + " (Battery)");
       const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
-      info.setCharacteristic(Characteristic.BatteryLevel, this._clampPct(finalLevel));
-      info.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
-      info.setCharacteristic(
+      batt.setCharacteristic(Characteristic.BatteryLevel, this._clampPct(finalLevel));
+      batt.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
+      batt.setCharacteristic(
         Characteristic.StatusLowBattery,
         (level !== null ? (level <= 20) : lowFlag)
           ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
@@ -343,6 +343,9 @@ class SFRHomePlatform {
 
     switch ((d.deviceType || "").toUpperCase()) {
       case "ALARM_PANEL":
+        accessory.addService(Service.AccessCode, accessory.displayName);
+        break;
+        
       case "REMOTE":
       case "KEYPAD":
       case "SIREN":
@@ -355,7 +358,7 @@ class SFRHomePlatform {
         break;
 
       case "PIR_DETECTOR":
-        accessory.addService(Service.MotionSensor, accessory.displayName);
+        accessory.addService(Service.OccupancySensor, accessory.displayName);
         break;
 
       case "SMOKE":
@@ -363,8 +366,8 @@ class SFRHomePlatform {
         break;
 
       case "TEMP_HUM":
-        accessory.addService(Service.TemperatureSensor, accessory.displayName + " Temp");
-        accessory.addService(Service.HumiditySensor, accessory.displayName + " Hum");
+        accessory.addService(Service.TemperatureSensor, accessory.displayName + " (Temp)");
+        accessory.addService(Service.HumiditySensor, accessory.displayName + " (Hum)");
         break;
 
       case "CAMERA_WIFI":
@@ -378,25 +381,7 @@ class SFRHomePlatform {
       case "LED_BULB_DIMMER":
       case "LED_BULB_HUE":
       case "LED_BULB_COLOR": {
-        const svc = accessory.addService(Service.Lightbulb, accessory.displayName);
-        svc.getCharacteristic(Characteristic.On)
-          .onSet(async (value) => {
-            if (!this.enableWrite) {
-              this.log.warn(`(lecture seule) ${accessory.displayName} -> On=${value}`);
-              return;
-            }
-            try {
-              const id = this._stableIdOf(d);
-              const resp = await fetch(`${this.controlBaseUrl}/api/device/${encodeURIComponent(id)}/set`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ on: !!value })
-              });
-              if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            } catch (e) {
-              this.log.error(`Échec commande ON/OFF pour ${accessory.displayName}: ${e.message}`);
-            }
-          });
+        accessory.addService(Service.Lightbulb, accessory.displayName);
         break;
       }
 
@@ -491,6 +476,7 @@ class SFRHomePlatform {
     }
   }
 }
+
 
 
 
