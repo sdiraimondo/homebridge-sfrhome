@@ -35,8 +35,9 @@ class SFRHomePlatform {
     this.accessories = new Map();
 
     if (!this.devicesPath) {
-      this.log.error("devicesPath manquant — configurez-le dans config.json");
-      return;
+      this.devicesPath = "/tmp/devices.json";
+      //this.log.error("devicesPath manquant — configurez-le dans config.json");
+      //return;
     }
 
     this.api.on("didFinishLaunching", () => {
@@ -77,14 +78,20 @@ class SFRHomePlatform {
     const c = hap.Categories;
     switch ((d.deviceType || "").toUpperCase()) {
       case "ALARM_PANEL": return c.SECURITY_SYSTEM;
+      case "REMOTE": return c.SECURITY_SYSTEM;
+      case "KEYPAD": return c.SECURITY_SYSTEM;
+      case "SOLAR_SIREN": return c.SECURITY_SYSTEM;
+      case "SIREN": return c.SECURITY_SYSTEM;
       case "MAGNETIC": return c.SENSOR;
       case "PIR_DETECTOR": return c.SENSOR;
       case "SMOKE": return c.SENSOR;
       case "TEMP_HUM": return c.SENSOR;
-      case "LED_BULB_DIMMER":
-      case "LED_BULB_HUE":
-      case "LED_BULB_COLOR":
-      case "ON_OFF_PLUG": return c.LIGHTBULB;
+      case "LED_BULB_DIMMER": return c.LIGHTBULB;
+      case "LED_BULB_HUE": return c.LIGHTBULB;
+      case "LED_BULB_COLOR": return c.LIGHTBULB;
+      case "WIFI_CAMERA": return c.CAMERA;
+      case "ON_OFF_PLUG": return c.SWITCH;
+      case "SHUTTER_COMMAND": return c.SWITCH;
       default: return c.OTHER;
     }
   }
@@ -195,7 +202,7 @@ class SFRHomePlatform {
       const id = this._stableIdOf(d);
       const name = (d.name || "").trim();
 
-      // --- 🔥 Filtrage d'exclusion ---
+      // Exclusions de certains devices par nom ou par modèle, si indiqués dans le config.json
       if (excludedNames.includes(name.toLowerCase())) {
         this.log.info(`[SFR Home] Périphérique exclu par nom : ${name}`);
         continue;
@@ -225,7 +232,7 @@ class SFRHomePlatform {
       this._updateValues(accessory, d);
     }
 
-    // retirer ceux qui n'existent plus
+    // Retire les devices qui n'existent plus
     const toRemove = [];
     for (const [uuid, acc] of this.accessories.entries()) {
       if (!seen.has(uuid)) {
@@ -239,7 +246,8 @@ class SFRHomePlatform {
     }
   }
 
-  // ---------- Services ----------
+  // Set up initial des devices
+  // -------------------------------------------------------------------------------------------------------------
   _setupServices(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
 
@@ -257,9 +265,6 @@ class SFRHomePlatform {
 
     switch ((d.deviceType || "").toUpperCase()) {
       case "ALARM_PANEL":
-        accessory.addService(Service.AccessCode, accessory.displayName);
-        break;
-        
       case "REMOTE":
       case "KEYPAD":
       case "SIREN":
@@ -303,6 +308,8 @@ class SFRHomePlatform {
         accessory.addService(Service.MotionSensor, accessory.displayName);
     }
 
+    // Ajout en parallèle de devices de type Batterie pour récupérer le niveau de batterie des devices
+    // -------------------------------------------------------------------------------------------------------------
     const level = this._extractBatteryNormalized(d);
     const lowFlag = this._hasLowBatFlag(d);
     if (level !== null || lowFlag) {
@@ -319,12 +326,14 @@ class SFRHomePlatform {
     }
   }
 
-  // ---------- Mises à jour ----------
+  // Mises à jour des paramètres spécifiques à chaque type de device
+  // -------------------------------------------------------------------------------------------------------------
   _updateValues(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
     const getSV = (name) => d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
     const status = (d.status || "").toUpperCase();
 
+    // Devices de type Alarm : Clavier, télécommande, sirène
     if (["ALARM_PANEL","REMOTE","KEYPAD","SIREN"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.SecuritySystem);
       if (svc) {
@@ -347,6 +356,7 @@ class SFRHomePlatform {
       }
     }
 
+    // Détecteur d'ouverture
     if ((d.deviceType || "").toUpperCase() === "MAGNETIC") {
       const svc = accessory.getService(Service.ContactSensor);
       if (svc) {
@@ -359,6 +369,7 @@ class SFRHomePlatform {
       }
     }
 
+    // Détecteur de mouvement
     if ((d.deviceType || "").toUpperCase() === "PIR_DETECTOR") {
       const svc = accessory.getService(Service.MotionSensor);
       if (svc) {
@@ -367,6 +378,7 @@ class SFRHomePlatform {
       }
     }
 
+    // Détecteur de fumée
     if ((d.deviceType || "").toUpperCase() === "SMOKE") {
       const svc = accessory.getService(Service.SmokeSensor);
       if (svc) {
@@ -379,6 +391,7 @@ class SFRHomePlatform {
       }
     }
 
+    // Capteur de température (et d'humidité), ajoutés commes 2 devices distincts
     if ((d.deviceType || "").toUpperCase() === "TEMP_HUM") {
       const tSvc = accessory.getService(Service.TemperatureSensor);
       const hSvc = accessory.getService(Service.HumiditySensor);
@@ -393,8 +406,17 @@ class SFRHomePlatform {
         if (!isNaN(n)) hSvc.updateCharacteristic(Characteristic.CurrentRelativeHumidity, n);
       }
     }
-
-    if (["LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR","ON_OFF_PLUG"].includes((d.deviceType || "").toUpperCase())) {
+    
+    case "CAMERA_WIFI":
+        accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
+        break;	  	  
+	  
+	  case "ON_OFF_PLUG":
+	  case "SHUTTER_COMMAND":
+        accessory.addService(Service.SmokeSensor, accessory.displayName);
+        break;	  
+    
+    if (["LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.Lightbulb);
       if (svc) {
         const reachable = status !== "UNREACHABLE";
