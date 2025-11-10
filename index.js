@@ -4,7 +4,7 @@
 
 let hap;
 const PLUGIN_NAME = "SFR Home pour Homebridge";
-const PLATFORM_NAME = "SFR Home";
+const PLATFORM_NAME = "SFRHomePlatform";
 
 module.exports = (api) => {
   hap = api.hap;
@@ -296,10 +296,11 @@ class SFRHomePlatform {
         break;
 
       case "CAMERA_WIFI":
-        accessory.addService(Service.Camera, accessory.displayName);
+        accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
         break;
 
       case "ON_OFF_PLUG":
+	  case "SHUTTER_COMMAND":
         accessory.addService(Service.Switch, accessory.displayName);
         break;
 
@@ -415,14 +416,12 @@ class SFRHomePlatform {
 	  
     // Caméra Wifi
 	if ((d.deviceType || "").toUpperCase() === "CAMERA_WIFI") {
-        accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
-        break;
+        accessory.addService(Service.CameraOperatingMode, accessory.displayName);
 	}
 
     // Prise programmable + Commande volet Legrand
     if (["ON_OFF_PLUG","SHUTTER_COMMAND"].includes((d.deviceType || "").toUpperCase())) {
         accessory.addService(Service.SmokeSensor, accessory.displayName);
-        break;
 	}
 
     // Lumières SFR + Hue    
@@ -437,4 +436,3 @@ class SFRHomePlatform {
     }
   }
 }
-
