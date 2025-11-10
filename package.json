@@ -21,11 +21,9 @@
     "node": ">=18.0.0",
     "homebridge": ">=1.6.0"
   },
-  "scripts": {
-    "build": "pip install requests lxml beautifulsoup4"
-  }
   "dependencies": {},
   "peerDependencies": {
     "homebridge": ">=1.6.0"
   }
 }
+
