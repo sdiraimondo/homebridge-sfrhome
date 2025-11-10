@@ -416,12 +416,14 @@ class SFRHomePlatform {
     // Caméra Wifi
 	if ((d.deviceType || "").toUpperCase() === "CAMERA_WIFI") {
         accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
-        break;	  	  
+        break;
+	}
 
     // Prise programmable + Commande volet Legrand
     if (["ON_OFF_PLUG","SHUTTER_COMMAND"].includes((d.deviceType || "").toUpperCase())) {
         accessory.addService(Service.SmokeSensor, accessory.displayName);
-        break;	  
+        break;
+	}
 
     // Lumières SFR + Hue    
     if (["LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR"].includes((d.deviceType || "").toUpperCase())) {
@@ -435,3 +437,4 @@ class SFRHomePlatform {
     }
   }
 }
+
