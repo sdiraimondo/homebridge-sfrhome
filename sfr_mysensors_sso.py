@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sfr_mysensors_sso.py — SFR Home : SSO robuste + soumission du formulaire final (token_sso)
-+ récupération /mysensors + parsing XML -> devices.json + devices.csv
-+ ajout d'un device synthétique "Centrale d'alarme" (ALARM_PANEL) depuis les attributs root:
-  name="Centrale", model_type="TSC06SFR", alarm_mode="ON|OFF|CUSTOM"
+sfr_mysensors_sso.py — version avec gestion persistante des cookies:
+ - préférence aux cookies stockés (session_cookies.json)
+ - si échec cookie -> SSO avec credentials, suppression / récréation des cookies
+ - parsing XML : ajout device synthétique ALARM_PANEL + video_url pour CAMERA_WIFI
+ - normalisation générique du champ 'brand':
+     * '' (vide) conservé tel quel (périphériques SFR)
+     * 'logo_xxx.png' -> 'Xxx' (title case), idem si chemin contient 'logo_xxx.ext'
 
 Dépendances :
     pip install requests lxml beautifulsoup4
-
-Exemples :
-    python sfr_mysensors_sso.py --user ton.email@exemple        # mot de passe demandé en caché
-    python sfr_mysensors_sso.py --user ton.email@exemple --password 'TonMDP'
-    python sfr_mysensors_sso.py --cookie 'PHPSESSID=xxx; ...'   # utilise un cookie déjà authentifié
-    python sfr_mysensors_sso.py --use-local                     # parse un XML local pour tests
 """
-
 import os
 import sys
 import json
 import csv
+import re
 import argparse
 import getpass
 import requests
@@ -27,6 +24,7 @@ from bs4 import BeautifulSoup
 from lxml import etree
 from io import BytesIO
 from urllib.parse import urljoin
+from requests.cookies import RequestsCookieJar
 
 # ---------- valeurs par défaut ----------
 BASE_URL_DEFAULT = "https://home.sfr.fr/"
@@ -37,13 +35,14 @@ MYSENSORS_URL_DEFAULT = "https://home.sfr.fr/mysensors"
 LOCAL_XML_PATH = "/mnt/data/mysensors.xml"
 OUTPUT_JSON = "/tmp/devices.json"
 OUTPUT_CSV = "/tmp/devices.csv"
+COOKIE_FILE = "session_cookies.json"   # fichier de cookies persistés
 
 # ---------- arguments ----------
 def parse_args():
-    p = argparse.ArgumentParser(description="SFR Home: login SSO + fetch mysensors (robust)")
+    p = argparse.ArgumentParser(description="SFR Home: login SSO + fetch mysensors (robust) with cookie persistence")
     p.add_argument("--user","-u", help="Identifiant / email SFR")
     p.add_argument("--password","-p", help="Mot de passe (sinon, saisie cachée)")
-    p.add_argument("--cookie","-c", help="Chaîne Cookie (si fournie, login non utilisé)")
+    p.add_argument("--cookie","-c", help="Chaîne Cookie (si fournie, utilisée prioritairement à session_cookies.json)")
     p.add_argument("--use-local", action="store_true", help=f"Utiliser {LOCAL_XML_PATH} au lieu du réseau")
     p.add_argument("--base-url", default=BASE_URL_DEFAULT)
     p.add_argument("--login-url", default=LOGIN_URL_DEFAULT)
@@ -51,29 +50,57 @@ def parse_args():
     p.add_argument("--mysensors-url", default=MYSENSORS_URL_DEFAULT)
     return p.parse_args()
 
-# ---------- parsing XML (avec ALARM_PANEL) ----------
+# ---------- utils ----------
+def normalize_brand(raw: str) -> str:
+    """
+    Règle générique:
+      - Si vide -> 'SFR HOME' (périphériques SFR)
+      - Si type 'logo_philips.png' (ou chemin .../logo_philips.png) -> 'Philips'
+      - Remplace '_' et '-' par espaces, Title Case.
+    """
+    if not raw or not str(raw).strip():
+        return "SFR HOME"
+    s = str(raw).strip()
+
+    # On récupère le dernier segment (au cas où il y a un chemin)
+    last = s.split("/")[-1]
+
+    # Cherche 'logo_xxx.ext' (xxx en minuscules/chiffres)
+    m = re.match(r'^logo[_-]([a-z0-9_ -]+?)(?:\.[A-Za-z0-9]+)?$', last)
+    if not m:
+        # parfois l'extension peut ne pas être présente ou pattern légèrement différent
+        m = re.search(r'logo[_-]([a-z0-9_ -]+)', last)
+    if m:
+        core = m.group(1)
+    else:
+        # Pas de pattern 'logo_...' : on renvoie la valeur brute
+        return s
+
+    core = core.replace("_", " ").replace("-", " ").strip()
+    if not core:
+        return "SFR HOME"
+
+    # Title Case sans forcer d'accents spécifiques
+    normalized = " ".join(w.capitalize() for w in core.split())
+    return normalized
+ 
+
+# ---------- parsing XML (avec ALARM_PANEL + video_url + brand normalisé) ----------
 def parse_sensors_xml(xml_bytes):
-    """
-    Parse le XML /mysensors et retourne une liste de devices.
-    - Convertit _Attrib en dict standard
-    - Ajoute un device synthétique "Centrale d'alarme" (ALARM_PANEL) si
-      des attributs root name/model_type/alarm_mode sont présents.
-    """
     parser = etree.XMLParser(recover=True, encoding='utf-8')
     root = etree.parse(BytesIO(xml_bytes), parser).getroot()
     devices = []
 
-    # 0) Centrale d'alarme depuis les attributs du root (si présents)
-    #    Ex: name="Centrale" model_type="TSC06SFR" alarm_mode="ON|OFF|CUSTOM"
+    # Centrale d'alarme depuis attributs root
     root_name = root.attrib.get("name") or root.attrib.get("panel_name") or root.attrib.get("hub_name")
     root_model = root.attrib.get("model_type") or root.attrib.get("model") or root.attrib.get("type")
-    root_mode = root.attrib.get("alarm_mode") or root.attrib.get("mode")  # ON / OFF / CUSTOM
+    root_mode = root.attrib.get("alarm_mode") or root.attrib.get("mode")
     if root_name or root_model or root_mode:
         panel = {
-            "id": "panel",                # id fixe stable
+            "id": "panel",
             "rrd_id": "-1",
             "nameable": "1",
-            "brand": "SFR HOME",
+            "brand": "SFR HOME",  # cohérent avec précédentes versions
             "zone": "-1",
             "group": "-1",
             "testable": "0",
@@ -95,15 +122,19 @@ def parse_sensors_xml(xml_bytes):
         }
         devices.append(panel)
 
-    # 1) Capteurs / actionneurs du XML
+    # Capteurs / actionneurs
     for s in root.findall(".//Sensor"):
-        dev = dict(s.attrib)  # attributs du <Sensor>
+        dev = dict(s.attrib)
 
-        # champs texte courants
+        # Champs texte usuels
         for tag in ("deviceType","deviceModel","deviceVersion","name","long_name",
-                    "batteryLevel","deviceMac", "signalLevel","status","categories"):
+                    "batteryLevel","deviceMac", "signalLevel","status","categories","brand"):
             el = s.find(tag)
-            dev[tag] = el.text.strip() if (el is not None and el.text) else None
+            dev[tag] = el.text.strip() if (el is not None and el.text) else dev.get(tag)
+
+        # Normaliser brand s'il existe (vide conservé)
+        if "brand" in dev and dev["brand"] is not None:
+            dev["brand"] = normalize_brand(dev["brand"])
 
         # sensorValues
         sv = {}
@@ -112,25 +143,32 @@ def parse_sensors_xml(xml_bytes):
             if not name:
                 name = f"value_{len(sv)+1}"
             val = (sv_el.text or "").strip()
-            attrs = dict(sv_el.attrib)  # convertir en dict standard
+            attrs = dict(sv_el.attrib)
             if name in sv:
-                # éviter les collisions de noms
                 idx = 2
                 while f"{name}_{idx}" in sv:
                     idx += 1
                 name = f"{name}_{idx}"
             sv[name] = {"value": val, "attrs": attrs}
-
         dev["sensorValues"] = sv or None
+
+        # Video URL pour caméras
+        dtype = (dev.get("deviceType") or "").upper()
+        if dtype == "CAMERA_WIFI":
+            mac = dev.get("deviceMac")
+            dev["video_url"] = f"https://home.sfr.fr/homescope/flv?localconn=0&mac={mac}" if mac else None
+
         devices.append(dev)
 
     return devices
 
 def save_outputs(devices):
+    # JSON
     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
         json.dump(devices, f, indent=2, ensure_ascii=False)
 
-    keys = ["id","deviceType","name","status","batteryLevel","deviceMac", "signalLevel","categories"]
+    # CSV (ajout de 'brand')
+    keys = ["id","deviceType","name","status","batteryLevel","deviceMac", "signalLevel","categories","brand","video_url"]
     with open(OUTPUT_CSV, "w", newline='', encoding="utf-8") as csvf:
         writer = csv.DictWriter(csvf, fieldnames=keys)
         writer.writeheader()
@@ -150,7 +188,65 @@ def dump_cookies(session, filename="debug_cookies.txt", prefix=""):
     except Exception:
         pass
 
-# ---------- SSO & formulaires ----------
+# ---------- cookie persistence helpers ----------
+def save_cookies_file(session, path=COOKIE_FILE):
+    try:
+        cookies_list = []
+        for c in session.cookies:
+            cookies_list.append({
+                "name": c.name,
+                "value": c.value,
+                "domain": c.domain,
+                "path": c.path,
+                "expires": getattr(c, "expires", None)
+            })
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cookies_list, f, indent=2)
+        print(f"[+] Cookies sauvegardés dans {path}")
+    except Exception as e:
+        print(f"[!] Échec sauvegarde cookies: {e}")
+
+def load_cookies_file(session, path=COOKIE_FILE):
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cookies_list = json.load(f)
+        jar = RequestsCookieJar()
+        for c in cookies_list:
+            name = c.get("name")
+            value = c.get("value")
+            domain = c.get("domain")
+            path_ = c.get("path") or "/"
+            jar.set(name, value, domain=domain, path=path_)
+        session.cookies = jar
+        print(f"[+] Cookies chargés depuis {path}")
+        return True
+    except Exception as e:
+        print(f"[!] Échec lecture cookies {path}: {e}")
+        return False
+
+def remove_cookies_file(path=COOKIE_FILE):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"[+] Fichier cookies {path} supprimé")
+    except Exception as e:
+        print(f"[!] Impossible de supprimer {path}: {e}")
+
+def parse_cookie_string_to_session(cookie_str):
+    session = requests.Session()
+    session.headers.update({"User-Agent":"Mozilla/5.0", "Accept":"*/*"})
+    jar = RequestsCookieJar()
+    parts = [p.strip() for p in cookie_str.split(";") if p.strip()]
+    for p in parts:
+        if "=" in p:
+            k,v = p.split("=",1)
+            jar.set(k.strip(), v.strip(), path="/")
+    session.cookies = jar
+    return session
+
+# ---------- SSO & formulaires (inchangés de ta version qui marche) ----------
 def post_sso(session, base_url, user, password):
     url = urljoin(base_url, SSO_ENDPOINT)
     data = {"connectionSFR": user, "passSFR": password}
@@ -166,13 +262,6 @@ def post_sso(session, base_url, user, password):
         return {"raw_text": r.text}
 
 def submit_final_form(session, login_url, token_sso, user=None, password=None):
-    """
-    GET /login, trouver form (#loginForm / #login_form_add_rib), copier tous les inputs,
-    injecter token_sso (name attendu), forcer email et passwd si présents,
-    inclure le bouton submit s'il existe, POST vers l'action.
-    Écrit des fichiers debug_*.html et headers.
-    Retourne l'URL finale après submit.
-    """
     r = session.get(login_url, headers={"Referer": login_url, "Accept":"text/html,*/*"}, timeout=20)
     r.raise_for_status()
     with open("debug_login_page.html","w",encoding="utf-8") as f:
@@ -202,6 +291,7 @@ def submit_final_form(session, login_url, token_sso, user=None, password=None):
     if submit_btn and submit_btn.get("name"):
         payload[submit_btn["name"]] = submit_btn.get("value", "")
 
+    # (ta version) injection token dans 'token_sso'
     payload["token_sso"] = token_sso
 
     if user and "email" in payload and not payload.get("email"):
@@ -271,25 +361,50 @@ def main():
         save_outputs(devices)
         return
 
-    # Cookie direct ?
-    cookie_str = args.cookie or os.getenv("SFR_SESSION_COOKIE")
-    if cookie_str:
-        print("[*] Utilisation d’un cookie de session fourni")
-        session = requests.Session()
-        session.headers.update({"User-Agent":"Mozilla/5.0", "Accept":"*/*", "Cookie": cookie_str})
-        xml = fetch_mysensors(session, args.mysensors_url, referer=args.dashboard_url)
-        with open("mysensors_raw.xml","wb") as f:
-            f.write(xml)
-        print(f"[+] mysensors récupéré ({len(xml)} octets)")
-        devices = parse_sensors_xml(xml)
-        print(f"[+] Parse OK : {len(devices)} devices")
-        save_outputs(devices)
-        return
+    # Cookie explicite ?
+    explicit_cookie = args.cookie or os.getenv("SFR_SESSION_COOKIE")
+    if explicit_cookie:
+        print("[*] Utilisation d’un cookie fourni via --cookie / SFR_SESSION_COOKIE")
+        session = parse_cookie_string_to_session(explicit_cookie)
+        try:
+            xml = fetch_mysensors(session, args.mysensors_url, referer=args.dashboard_url)
+            with open("mysensors_raw.xml","wb") as f:
+                f.write(xml)
+            print(f"[+] mysensors récupéré ({len(xml)} octets) via cookie explicite")
+            devices = parse_sensors_xml(xml)
+            save_outputs(devices)
+            save_cookies_file(session)
+            return
+        except Exception as e:
+            print(f"[!] Échec avec cookie fourni: {e}")
+            # on continue vers cookie-file / sso
 
-    # SSO complet
+    # Cookies persistés ?
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent":"Mozilla/5.0",
+        "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+
+    if load_cookies_file(session):
+        try:
+            print("[*] Tentative d'accès via cookies stockés")
+            xml = fetch_mysensors(session, args.mysensors_url, referer=args.dashboard_url)
+            with open("mysensors_raw.xml","wb") as f:
+                f.write(xml)
+            print(f"[+] mysensors récupéré ({len(xml)} octets) via cookies stockés")
+            devices = parse_sensors_xml(xml)
+            save_outputs(devices)
+            return
+        except Exception as e:
+            print(f"[!] Échec via cookies stockés: {e}")
+            dump_cookies(session, prefix="[FAIL COOKIE LOAD] ")
+            remove_cookies_file()
+
+    # SSO
     user = args.user or os.getenv("SFR_USER")
     if not user:
-        print("[!] Fournis --user ou SFR_USER.")
+        print("[!] Fournis --user ou SFR_USER pour authentification initiale.")
         sys.exit(2)
     password = args.password or getpass.getpass(prompt=f"Mot de passe pour {user}: ")
 
@@ -305,9 +420,12 @@ def main():
     if isinstance(sso, dict) and isinstance(sso.get("result"), dict):
         token = sso["result"].get("token_sso")
     if not token:
-        print("[!] token_sso manquant — flux peut avoir changé.")
+        print("[!] token_sso manquant — flux peut avoir changé. Dump SSO en debug_sso.json")
         with open("debug_sso.json","w",encoding="utf-8") as f:
-            f.write(json.dumps(sso, indent=2, ensure_ascii=False))
+            try:
+                f.write(json.dumps(sso, indent=2, ensure_ascii=False))
+            except Exception:
+                f.write(str(sso))
         sys.exit(1)
     print("  token_sso reçu.")
 
@@ -328,6 +446,8 @@ def main():
         print("    -> Consulte debug_dashboard.html")
         sys.exit(1)
     print("  URL dashboard:", dash_url)
+
+    save_cookies_file(session)
 
     print("[*] Étape 4/4 — Récupération mysensors")
     try:
