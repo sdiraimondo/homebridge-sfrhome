@@ -108,7 +108,7 @@ class SFRHomePlatform {
   _findOnOffInSensorValues(d) {
     const sv = d.sensorValues || {};
     //const candidates = ["state","power","on","switch","relay","onoff","status"];
-    const candidates = ["status"];
+    const candidates = ["trigger"];
 	for (const name of Object.keys(sv)) {
       const low = name.toLowerCase();
       if (candidates.includes(low)) {
@@ -267,7 +267,8 @@ class SFRHomePlatform {
     info
       .setCharacteristic(Characteristic.Manufacturer, d.brand || "SFR HOME")
       .setCharacteristic(Characteristic.Model, d.deviceModel || d.deviceType || "Unknown")
-      .setCharacteristic(Characteristic.SerialNumber, serial);
+      .setCharacteristic(Characteristic.SerialNumber, serial || "Unknown")
+	  .setCharacteristic(Characteristic.FirmwareRevision, d.deviceVersion || "1.0");
 
     switch ((d.deviceType || "").toUpperCase()) {
       case "ALARM_PANEL":
@@ -315,6 +316,7 @@ class SFRHomePlatform {
         accessory.addService(Service.MotionSensor, accessory.displayName);
     }
 
+
     // Ajout en parallèle de devices de type Batterie pour récupérer le niveau de batterie des devices
     // -------------------------------------------------------------------------------------------------------------
     const level = this._extractBatteryNormalized(d);
@@ -324,16 +326,14 @@ class SFRHomePlatform {
       const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
       batt.setCharacteristic(Characteristic.BatteryLevel, this._clampPct(finalLevel));
       batt.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
-      batt.setCharacteristic(
-        Characteristic.StatusLowBattery,
-        (level !== null ? (level <= 20) : lowFlag)
-          ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+      batt.setCharacteristic(Characteristic.StatusLowBattery, (level !== null ? (level <= 20) : lowFlag)
+          ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW 
           : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
       );
     }
   }
 
-  // Mises à jour des paramètres spécifiques à chaque type de device
+  // Mises à jour des devices selon les paramètres spécifiques de chaque type de device
   // -------------------------------------------------------------------------------------------------------------
   _updateValues(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
