@@ -35,7 +35,7 @@ MYSENSORS_URL_DEFAULT = "https://home.sfr.fr/mysensors"
 LOCAL_XML_PATH = "/mnt/data/mysensors.xml"
 OUTPUT_JSON = "/tmp/devices.json"
 OUTPUT_CSV = "/tmp/devices.csv"
-COOKIE_FILE = "/tmp/sfrhome_session_cookies.json"
+COOKIE_FILE = "session_cookies.json"   # fichier de cookies persistés
 
 # ---------- arguments ----------
 def parse_args():
@@ -466,4 +466,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
