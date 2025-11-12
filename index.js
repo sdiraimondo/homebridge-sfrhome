@@ -198,18 +198,70 @@ class SFRHomePlatform {
   }
 
   async _plugAction(uid, action = null) {
-    const cookies = this._loadCookiesHeader();
-    if (!cookies) throw new Error("Cookies SFR manquants");
-    const url = action
-      ? `https://home.sfr.fr/plugcontrol?uid=${encodeURIComponent(uid)}&action=${action}`
-      : `https://home.sfr.fr/plugcontrol?uid=${encodeURIComponent(uid)}`;
-    const resp = await axios.get(url, { headers: { Cookie: cookies } });
-    const xml = String(resp.data || "");
-    // ONOFF 1/0
-    const m = xml.match(/<ONOFF>(\d+)<\/ONOFF>/);
-    const onoff = m ? parseInt(m[1], 10) : 0;
-    return onoff === 1;
+    // charge cookies à CHAQUE appel (ils peuvent être régénérés par le cron)
+    const loadHeader = () => {
+      try {
+        const data = JSON.parse(fs.readFileSync(this.cookiePath, "utf8"));
+        const h = data.map(c => `${c.name}=${c.value}`).join("; ");
+        if (!h) throw new Error("cookie file empty");
+        return h;
+      } catch (e) {
+        throw new Error(`Cookies manquants/illisibles (${this.cookiePath}): ${e.message}`);
+      }
+    };
+  
+    const doReq = async (cookieHeader) => {
+      const url = action
+        ? `https://home.sfr.fr/plugcontrol?uid=${encodeURIComponent(uid)}&action=${action}`
+        : `https://home.sfr.fr/plugcontrol?uid=${encodeURIComponent(uid)}`;
+  
+      // SFR aime avoir ces headers (simule un XHR depuis le site)
+      const headers = {
+        Cookie: cookieHeader,
+        Referer: "https://home.sfr.fr/accueil",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0",
+        Accept: "application/xml,text/xml,*/*"
+      };
+  
+      const resp = await axios.get(url, {
+        headers,
+        maxRedirects: 0,
+        validateStatus: s => (s >= 200 && s < 300) || s === 302 || s === 303 || s === 403
+      });
+  
+      if (resp.status === 403) {
+        throw new Error("403");
+      }
+      if (resp.status === 302 || resp.status === 303) {
+        throw new Error(`Redirection ${resp.status} (auth requise)`);
+      }
+      const xml = String(resp.data || "");
+      const m = xml.match(/<ONOFF>(\d+)<\/ONOFF>/);
+      const onoff = m ? parseInt(m[1], 10) : 0;
+      return onoff === 1;
+    };
+  
+    // 1er essai avec les cookies actuels
+    try {
+      const ck = loadHeader();
+      return await doReq(ck);
+    } catch (e) {
+      // Si 403, on retente une fois après relecture (le cron a peut-être régénéré le fichier)
+      if (String(e.message).includes("403")) {
+        this.log.warn("[SFR Home] 403 plugcontrol : relecture des cookies et nouvel essai...");
+        try {
+          const ck2 = loadHeader(); // rechargé
+          return await doReq(ck2);
+        } catch (e2) {
+          // message plus explicite
+          throw new Error(`403 après reload cookies. Vérifie que ${this.cookiePath} est à jour et lisible (cron). Détail: ${e2.message}`);
+        }
+      }
+      throw e;
+    }
   }
+
 
   // ---------- Cycle principal d'ajout des devices ----------
   _reconcile(devices) {
@@ -490,4 +542,5 @@ class SFRHomePlatform {
     }
   }
 }
+
 
