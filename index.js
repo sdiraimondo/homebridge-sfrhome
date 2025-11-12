@@ -1,8 +1,10 @@
 // homebridge-sfrhome / index.js
-// v0.3.3
-
+// v0.3.4 - ON_OFF_PLUG control via /plugcontrol + cookie-based auth
 
 let hap;
+const fs = require("fs");
+const axios = require("axios");
+
 const PLUGIN_NAME = "SFR Home pour Homebridge";
 const PLATFORM_NAME = "SFRHomePlatform";
 
@@ -11,14 +13,14 @@ module.exports = (api) => {
   api.registerPlatform(PLUGIN_NAME, PLATFORM_NAME, SFRHomePlatform);
 };
 
-
 class SFRHomePlatform {
   constructor(log, config, api) {
     this.log = log;
     this.api = api;
     this.config = config || {};
     this.name = this.config.name || "SFR Home";
-    this.devicesPath = this.config.devicesPath || "/path/vers/devices.json";
+
+    this.devicesPath = this.config.devicesPath || "/tmp/devices.json";
     this.refreshSeconds = Number(this.config.refreshSeconds || 60);
 
     // Options d'exclusion (noms, modèles)
@@ -30,12 +32,16 @@ class SFRHomePlatform {
     const port = this.config.controlPort || 5000;
     this.controlBaseUrl = `${base.replace(/\/$/, "")}:${port}`;
 
+    // Chemin des cookies persistés (générés par ton script Python)
+    this.cookiePath = "/tmp/sfrhome_session_cookies.json";
+
+    // Périodicité de lecture d’état via plugcontrol (utilisée au tick global)
+    this.plugPollMs = Number(this.config.plugPollMs || 30000);
+
     this.accessories = new Map();
 
     if (!this.devicesPath) {
       this.devicesPath = "/tmp/devices.json";
-      //this.log.error("devicesPath manquant — configurez-le dans config.json");
-      //return;
     }
 
     this.api.on("didFinishLaunching", () => {
@@ -50,7 +56,6 @@ class SFRHomePlatform {
   }
 
   _tick() {
-    const fs = require("fs");
     fs.readFile(this.devicesPath, "utf8", (err, data) => {
       if (err) {
         this.log.warn(`Impossible de lire ${this.devicesPath}: ${err.message}`);
@@ -70,7 +75,6 @@ class SFRHomePlatform {
       this._reconcile(list);
     });
   }
-
 
   // ---------- Helpers ----------
   _categoryFor(d) {
@@ -107,25 +111,18 @@ class SFRHomePlatform {
 
   _findOnOffInSensorValues(d) {
     const sv = d.sensorValues || {};
-    //const candidates = ["state","power","on","switch","relay","onoff","status"];
     const candidates = ["trigger"];
-	for (const name of Object.keys(sv)) {
+    for (const name of Object.keys(sv)) {
       const low = name.toLowerCase();
       if (candidates.includes(low)) {
         const val = sv[name].value;
-        if (typeof val === "string" && /^(on|off|true|false|0|1)$/i.test(val.trim())) {
-          return this._boolFromValue(val);
-        }
         return this._boolFromValue(val);
       }
     }
     return null;
   }
 
-
-  // Batterie : Récupération de la valeur et normalisation de la valeur
-  // -------------------------------------------------------------------------------------------------------------
-  
+  // Batterie : Récupération de la valeur et normalisation
   _clampPct(x) { return Math.max(0, Math.min(100, Number(x))); }
 
   _extractPercentFromString(str) {
@@ -145,7 +142,6 @@ class SFRHomePlatform {
 
   _extractBatteryPercentFromSV(sv) {
     if (!sv) return null;
-    // d’abord clés typées Battery
     for (const k of Object.keys(sv)) {
       if (/^battery(level)?$/i.test(k)) {
         const v = sv[k]?.value;
@@ -153,7 +149,6 @@ class SFRHomePlatform {
         if (n !== null) return n;
       }
     }
-    // sinon, tente toutes les valeurs
     for (const k of Object.keys(sv)) {
       const v = sv[k]?.value;
       const n = this._extractPercentFromString(String(v ?? ""));
@@ -176,11 +171,8 @@ class SFRHomePlatform {
   }
 
   _extractBatteryNormalized(d) {
-    // 1) % explicite dans sensorValues → prioritaire
     const fromSV = this._extractBatteryPercentFromSV(d.sensorValues);
     if (fromSV !== null) return this._clampPct(fromSV);
-
-    // 2) Échelle 1..10 via batteryLevel
     if (d.batteryLevel !== undefined && d.batteryLevel !== null) {
       const raw = Number(d.batteryLevel);
       if (Number.isFinite(raw)) {
@@ -189,14 +181,37 @@ class SFRHomePlatform {
         if (raw >= 0 && raw <= 100) return this._clampPct(raw);
       }
     }
-
     return null;
   }
 
+  // ---------- Cookies & Plug control ----------
+  _loadCookiesHeader() {
+    try {
+      const data = JSON.parse(fs.readFileSync(this.cookiePath, "utf8"));
+      const header = data.map(c => `${c.name}=${c.value}`).join("; ");
+      if (!header) throw new Error("cookie file empty");
+      return header;
+    } catch (e) {
+      this.log.warn(`[SFR Home] Cookies manquants/illisibles (${this.cookiePath}): ${e.message}`);
+      return null;
+    }
+  }
 
-  // Cycle principal d'ajout des devices
-  // -------------------------------------------------------------------------------------------------------------
-  
+  async _plugAction(uid, action = null) {
+    const cookies = this._loadCookiesHeader();
+    if (!cookies) throw new Error("Cookies SFR manquants");
+    const url = action
+      ? `https://home.sfr.fr/plugcontrol?uid=${encodeURIComponent(uid)}&action=${action}`
+      : `https://home.sfr.fr/plugcontrol?uid=${encodeURIComponent(uid)}`;
+    const resp = await axios.get(url, { headers: { Cookie: cookies } });
+    const xml = String(resp.data || "");
+    // ONOFF 1/0
+    const m = xml.match(/<ONOFF>(\d+)<\/ONOFF>/);
+    const onoff = m ? parseInt(m[1], 10) : 0;
+    return onoff === 1;
+  }
+
+  // ---------- Cycle principal d'ajout des devices ----------
   _reconcile(devices) {
     const seen = new Set();
 
@@ -208,7 +223,6 @@ class SFRHomePlatform {
       const id = this._stableIdOf(d);
       const name = (d.name || "").trim();
 
-      // Exclusions de certains devices par nom ou par modèle, si indiqués dans le config.json
       if (excludedNames.includes(name.toLowerCase())) {
         this.log.info(`[SFR Home] Périphérique exclu par nom : ${name}`);
         continue;
@@ -252,11 +266,11 @@ class SFRHomePlatform {
     }
   }
 
-  // Set up initial des devices
-  // -------------------------------------------------------------------------------------------------------------
+  // ---------- Set up initial des devices ----------
   _setupServices(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
 
+    // On repart propre à chaque tick (hors AccessoryInformation)
     accessory.services
       .filter((s) => !(s instanceof Service.AccessoryInformation))
       .forEach((s) => accessory.removeService(s));
@@ -268,13 +282,13 @@ class SFRHomePlatform {
       .setCharacteristic(Characteristic.Manufacturer, d.brand || "SFR HOME")
       .setCharacteristic(Characteristic.Model, d.deviceModel || d.deviceType || "Unknown")
       .setCharacteristic(Characteristic.SerialNumber, serial || "Unknown")
-	  .setCharacteristic(Characteristic.FirmwareRevision, d.deviceVersion || "1.0");
+      .setCharacteristic(Characteristic.FirmwareRevision, d.deviceVersion || "1.0");
 
     switch ((d.deviceType || "").toUpperCase()) {
       case "ALARM_PANEL":
         accessory.addService(Service.SecuritySystem, accessory.displayName);
         break;
-		
+
       case "REMOTE":
       case "KEYPAD":
       case "SIREN":
@@ -300,8 +314,35 @@ class SFRHomePlatform {
         accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
         break;
 
-      case "ON_OFF_PLUG":
-	  case "SHUTTER_COMMAND":
+      case "ON_OFF_PLUG": {
+        const svc = accessory.addService(Service.Switch, accessory.displayName);
+        // Lier les handlers seulement une fois par accessoire
+        if (!svc._sfrBound) {
+          svc.getCharacteristic(Characteristic.On)
+            .on("set", async (value, callback) => {
+              try {
+                await this._plugAction(d.id, value ? "on" : "off");
+                this.log.info(`[SFR Home] ${d.name} -> ${value ? "ON" : "OFF"}`);
+                callback();
+              } catch (e) {
+                this.log.error(`[SFR Home] Erreur commande ${d.name}: ${e.message}`);
+                callback(e);
+              }
+            })
+            .on("get", async (callback) => {
+              try {
+                const state = await this._plugAction(d.id, null);
+                callback(null, state);
+              } catch (e) {
+                callback(e);
+              }
+            });
+          svc._sfrBound = true;
+        }
+        break;
+      }
+
+      case "SHUTTER_COMMAND":
         accessory.addService(Service.Switch, accessory.displayName);
         break;
 
@@ -316,9 +357,7 @@ class SFRHomePlatform {
         accessory.addService(Service.MotionSensor, accessory.displayName);
     }
 
-
-    // Ajout en parallèle de devices de type Batterie pour récupérer le niveau de batterie des devices
-    // -------------------------------------------------------------------------------------------------------------
+    // Batterie
     const level = this._extractBatteryNormalized(d);
     const lowFlag = this._hasLowBatFlag(d);
     if (level !== null || lowFlag) {
@@ -326,21 +365,21 @@ class SFRHomePlatform {
       const finalLevel = (level !== null) ? level : (lowFlag ? 15 : 100);
       batt.setCharacteristic(Characteristic.BatteryLevel, this._clampPct(finalLevel));
       batt.setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGING);
-      batt.setCharacteristic(Characteristic.StatusLowBattery, (level !== null ? (level <= 20) : lowFlag)
-          ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW 
+      batt.setCharacteristic(Characteristic.StatusLowBattery,
+        (level !== null ? (level <= 20) : lowFlag)
+          ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
           : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
       );
     }
   }
 
-  // Mises à jour des devices selon les paramètres spécifiques de chaque type de device
-  // -------------------------------------------------------------------------------------------------------------
+  // ---------- Mises à jour des devices ----------
   _updateValues(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
     const getSV = (name) => d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
     const status = (d.status || "").toUpperCase();
 
-    // Devices de type Alarm : Clavier, télécommande, sirène
+    // ALARM PANEL
     if ((d.deviceType || "").toUpperCase() === "ALARM_PANEL") {
       const svc = accessory.getService(Service.SecuritySystem);
       if (svc) {
@@ -363,7 +402,7 @@ class SFRHomePlatform {
       }
     }
 
-    // Détecteur d'ouverture
+    // Contact (sirènes/telecommandes/magnétiques traités comme contact)
     if (["MAGNETIC","REMOTE","KEYPAD","SOLAR_SIREN","SIREN"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.ContactSensor);
       if (svc) {
@@ -376,7 +415,7 @@ class SFRHomePlatform {
       }
     }
 
-    // Détecteur de mouvement
+    // Mouvement
     if ((d.deviceType || "").toUpperCase() === "PIR_DETECTOR") {
       const svc = accessory.getService(Service.MotionSensor);
       if (svc) {
@@ -385,7 +424,7 @@ class SFRHomePlatform {
       }
     }
 
-    // Détecteur de fumée
+    // Fumée
     if ((d.deviceType || "").toUpperCase() === "SMOKE") {
       const svc = accessory.getService(Service.SmokeSensor);
       if (svc) {
@@ -398,7 +437,7 @@ class SFRHomePlatform {
       }
     }
 
-    // Capteur de température (et d'humidité), ajoutés commes 2 devices distincts
+    // Temp/Hum
     if ((d.deviceType || "").toUpperCase() === "TEMP_HUM") {
       const tSvc = accessory.getService(Service.TemperatureSensor);
       const hSvc = accessory.getService(Service.HumiditySensor);
@@ -413,18 +452,33 @@ class SFRHomePlatform {
         if (!isNaN(n)) hSvc.updateCharacteristic(Characteristic.CurrentRelativeHumidity, n);
       }
     }
-	  
-    // Caméra Wifi
-	if ((d.deviceType || "").toUpperCase() === "CAMERA_WIFI") {
-        accessory.addService(Service.CameraOperatingMode, accessory.displayName);
-	}
 
-    // Prise programmable + Commande volet Legrand
-    if (["ON_OFF_PLUG","SHUTTER_COMMAND"].includes((d.deviceType || "").toUpperCase())) {
-        accessory.addService(Service.SmokeSensor, accessory.displayName);
-	}
+    // Caméra - placeholder (flux à intégrer via module camera/ffmpeg si besoin)
+    if ((d.deviceType || "").toUpperCase() === "CAMERA_WIFI") {
+      // rien ici pour l’instant
+    }
 
-    // Lumières SFR + Hue    
+    // ON_OFF_PLUG: lecture synchrone de l’état réel à chaque tick
+    if ((d.deviceType || "").toUpperCase() === "ON_OFF_PLUG") {
+      const svc = accessory.getService(Service.Switch);
+      if (svc) {
+        this._plugAction(d.id, null)
+          .then(state => svc.updateCharacteristic(Characteristic.On, !!state))
+          .catch(e => this.log.warn(`[SFR Home] Échec lecture état ${d.name}: ${e.message}`));
+      }
+    }
+
+    // SHUTTER_COMMAND (toujours Switch, mais sans pilotage encore)
+    if ((d.deviceType || "").toUpperCase() === "SHUTTER_COMMAND") {
+      const svc = accessory.getService(Service.Switch);
+      if (svc) {
+        // fallback : basé sur reachability si pas d’info
+        const reachable = status !== "UNREACHABLE";
+        svc.updateCharacteristic(Characteristic.On, reachable);
+      }
+    }
+
+    // Lumières
     if (["LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.Lightbulb);
       if (svc) {
