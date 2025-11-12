@@ -3,6 +3,13 @@
   "version": "0.4.0",
   "description": "Expose SFR HOME devices to HomeKit via Homebridge using scrapping",
   "homepage": "https://github.com/sdiraimondo/homebridge-sfrhome#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sdiraimondo/homebridge-sfrhome"
+  },
+  "bugs": {
+    "url": "https://github.com/sdiraimondo/homebridge-sfrhome/issues"
+  },
   "author": "StephDi",
   "main": "index.js",
   "keywords": [
@@ -16,8 +23,12 @@
     "homebridge": ">=1.6.0"
   },
   "license": "MIT",
-  "dependencies": {},
+  "dependencies": {
+    "axios": "^1.6.2"
+  },
+  "deprecated": false,
   "peerDependencies": {
     "homebridge": ">=1.6.0"
   }
 }
+
