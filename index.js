@@ -464,7 +464,7 @@ class SFRHomePlatform {
       if (svc) {
         this._plugAction(d.id, null)
           .then(state => svc.updateCharacteristic(Characteristic.On, !!state))
-          .catch(e => this.log.warn(`[SFR Home] Échec lecture état ${d.name}: ${e.message}`));
+          .catch(e => this.log.warn(`[SFR Home] Échec lecture état ${d.name} (ID=${d.id}) : ${e.message}`));
       }
     }
 
@@ -490,3 +490,4 @@ class SFRHomePlatform {
     }
   }
 }
+
