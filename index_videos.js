@@ -1,10 +1,9 @@
 // homebridge-sfrhome / index.js
-// v0.4.0 - ON_OFF_PLUG control via /plugcontrol + cookie-based auth + Camera (ffmpeg/H.264)
+// v0.3.6 - ON_OFF_PLUG control via /plugcontrol + cookie-based auth + alarmmode control
 
 let hap;
 const fs = require("fs");
 const axios = require("axios");
-const { spawn } = require("child_process");
 
 const PLUGIN_NAME = "SFR Home pour Homebridge";
 const PLATFORM_NAME = "SFRHomePlatform";
@@ -33,16 +32,11 @@ class SFRHomePlatform {
     const port = this.config.controlPort || 5000;
     this.controlBaseUrl = `${base.replace(/\/$/, "")}:${port}`;
 
-    // Chemin des cookies persistés (générés par ton script Python)
+    // Chemin des cookies persistés (générés par le script Python)
     this.cookiePath = "/tmp/sfrhome_session_cookies.json";
 
     // Périodicité de lecture d’état via plugcontrol (utilisée au tick global)
     this.plugPollMs = Number(this.config.plugPollMs || 30000);
-
-    // Caméra / ffmpeg
-    this.ffmpegPath = this.config.ffmpegPath || "/usr/bin/ffmpeg";
-    this.cameraFPS = Number(this.config.cameraFPS || 15);
-    this.cameraMaxBitrate = Number(this.config.cameraMaxBitrate || 1200); // kbps
 
     this.accessories = new Map();
 
@@ -108,7 +102,9 @@ class SFRHomePlatform {
   }
 
   _stableIdOf(d) {
-    return (d.id && String(d.id)) || (d.rrd_id && String(d.rrd_id)) || `${d.deviceType || "DEVICE"}-${d.name || "unknown"}`;
+    return (d.id && String(d.id))
+      || (d.rrd_id && String(d.rrd_id))
+      || `${d.deviceType || "DEVICE"}-${d.name || "unknown"}`;
   }
 
   _boolFromValue(v) {
@@ -192,7 +188,7 @@ class SFRHomePlatform {
     return null;
   }
 
-  // ---------- Cookies & Plug / vidéo ----------
+  // ---------- Cookies & appels SFR ----------
   _loadCookiesHeader() {
     try {
       const data = JSON.parse(fs.readFileSync(this.cookiePath, "utf8"));
@@ -205,18 +201,7 @@ class SFRHomePlatform {
     }
   }
 
-  _buildVideoHeaders() {
-    const ck = this._loadCookiesHeader();
-    if (!ck) throw new Error("Cookies SFR manquants pour vidéo");
-    return [
-      `Cookie: ${ck}`,
-      "Referer: https://home.sfr.fr/accueil",
-      "X-Requested-With: XMLHttpRequest",
-      "User-Agent: Mozilla/5.0",
-      "Accept: */*"
-    ].join("\r\n");
-  }
-
+  // Contrôle des prises ON_OFF_PLUG via /plugcontrol
   async _plugAction(uid, action = null) {
     const loadHeader = () => {
       try {
@@ -277,6 +262,73 @@ class SFRHomePlatform {
     }
   }
 
+  // Contrôle de l’alarme via /alarmmode?action=off|on|custom
+  async _alarmAction(mode) {
+    const modeNorm = String(mode || "").toLowerCase();
+    if (!["off", "on", "custom"].includes(modeNorm)) {
+      throw new Error(`Mode alarme invalide: ${mode}`);
+    }
+
+    const loadHeader = () => {
+      try {
+        const data = JSON.parse(fs.readFileSync(this.cookiePath, "utf8"));
+        const h = data.map(c => `${c.name}=${c.value}`).join("; ");
+        if (!h) throw new Error("cookie file empty");
+        return h;
+      } catch (e) {
+        throw new Error(`Cookies manquants/illisibles (${this.cookiePath}): ${e.message}`);
+      }
+    };
+
+    const doReq = async (cookieHeader) => {
+      const url = `https://home.sfr.fr/alarmmode?action=${encodeURIComponent(modeNorm)}`;
+
+      const headers = {
+        Cookie: cookieHeader,
+        Referer: "https://home.sfr.fr/accueil",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0",
+        Accept: "application/xml,text/xml,*/*"
+      };
+
+      const resp = await axios.get(url, {
+        headers,
+        maxRedirects: 0,
+        validateStatus: s => (s >= 200 && s < 300) || s === 302 || s === 303 || s === 403
+      });
+
+      if (resp.status === 403) {
+        throw new Error("403");
+      }
+      if (resp.status === 302 || resp.status === 303) {
+        throw new Error(`Redirection ${resp.status} (auth requise)`);
+      }
+
+      const xml = String(resp.data || "");
+      const ok = /<STATUS>\s*OK\s*<\/STATUS>/i.test(xml);
+      if (!ok) {
+        throw new Error(`Réponse inattendue alarmmode: ${xml.slice(0, 200)}...`);
+      }
+      return true;
+    };
+
+    try {
+      const ck = loadHeader();
+      return await doReq(ck);
+    } catch (e) {
+      if (String(e.message).includes("403")) {
+        this.log.warn("[SFR Home] 403 alarmmode : relecture des cookies et nouvel essai...");
+        try {
+          const ck2 = loadHeader();
+          return await doReq(ck2);
+        } catch (e2) {
+          throw new Error(`403 après reload cookies (alarmmode). Vérifie que ${this.cookiePath} est à jour et lisible. Détail: ${e2.message}`);
+        }
+      }
+      throw e;
+    }
+  }
+
   // ---------- Cycle principal d'ajout des devices ----------
   _reconcile(devices) {
     const seen = new Set();
@@ -318,6 +370,7 @@ class SFRHomePlatform {
       this._updateValues(accessory, d);
     }
 
+    // Retire les devices qui n'existent plus
     const toRemove = [];
     for (const [uuid, acc] of this.accessories.entries()) {
       if (!seen.has(uuid)) {
@@ -335,6 +388,7 @@ class SFRHomePlatform {
   _setupServices(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
 
+    // On repart propre à chaque tick (hors AccessoryInformation)
     accessory.services
       .filter((s) => !(s instanceof Service.AccessoryInformation))
       .forEach((s) => accessory.removeService(s));
@@ -349,9 +403,63 @@ class SFRHomePlatform {
       .setCharacteristic(Characteristic.FirmwareRevision, d.deviceVersion || "1.0");
 
     switch ((d.deviceType || "").toUpperCase()) {
-      case "ALARM_PANEL":
-        accessory.addService(Service.SecuritySystem, accessory.displayName);
+      case "ALARM_PANEL": {
+        const svc = accessory.addService(Service.SecuritySystem, accessory.displayName);
+
+        // Handler HomeKit -> SFR (pilotage alarme)
+        svc.getCharacteristic(Characteristic.SecuritySystemTargetState)
+          .on("set", async (value, callback) => {
+            // Map HomeKit -> mode SFR
+            let mode = "off";
+            switch (value) {
+                case Characteristic.SecuritySystemTargetState.DISARM:
+                  // Off -> Désactivé
+                  mode = "off";
+                  break;
+        
+                case Characteristic.SecuritySystemTargetState.STAY_ARM:
+                  // Maison -> Désactivé (même comportement que Off)
+                  mode = "off";
+                  break;
+        
+                case Characteristic.SecuritySystemTargetState.NIGHT_ARM:
+                  // Nuit -> Custom
+                  mode = "custom";
+                  break;
+        
+                case Characteristic.SecuritySystemTargetState.AWAY_ARM:
+                  // Absent -> Activité (ON)
+                  mode = "on";
+                  break;
+        
+                default:
+                  // Par défaut, on joue la sécurité : off
+                  mode = "off";
+                  break;
+            }
+
+            try {
+              await this._alarmAction(mode);
+              this.log.info(`[SFR Home] Alarme -> ${mode.toUpperCase()}`);
+
+              // Feedback immédiat côté HomeKit (current state)
+              const curMap = {
+                "off": Characteristic.SecuritySystemCurrentState.DISARMED,
+                "custom": Characteristic.SecuritySystemCurrentState.NIGHT_ARM,
+                "on": Characteristic.SecuritySystemCurrentState.AWAY_ARM
+              };
+              const cur = curMap[mode] ?? Characteristic.SecuritySystemCurrentState.DISARMED;
+              svc.updateCharacteristic(Characteristic.SecuritySystemCurrentState, cur);
+
+              callback();
+            } catch (e) {
+              this.log.error(`[SFR Home] Erreur commande alarme (${mode}): ${e.message}`);
+              callback(e);
+            }
+          });
+
         break;
+      }
 
       case "REMOTE":
       case "KEYPAD":
@@ -374,39 +482,11 @@ class SFRHomePlatform {
         accessory.addService(Service.HumiditySensor, accessory.displayName + " (Hum)");
         break;
 
-      case "CAMERA_WIFI": {
-        if (!accessory._hasCameraController) {
-          const controller = new hap.CameraController({
-            cameraStreamCount: 2,
-            delegate: new FFmpegStreamingDelegate(this, d),
-            streamingOptions: {
-              video: {
-                codecs: [{
-                  type: hap.H264CodecType.MAIN,
-                  profiles: [hap.H264Profile.BASELINE, hap.H264Profile.MAIN],
-                  levels: [hap.H264Level.LEVEL3_1, hap.H264Level.LEVEL3_2, hap.H264Level.LEVEL4_0],
-                }],
-                codec: {
-                  profiles: [hap.H264Profile.BASELINE, hap.H264Profile.MAIN],
-                  levels: [hap.H264Level.LEVEL3_1, hap.H264Level.LEVEL3_2, hap.H264Level.LEVEL4_0],
-                },
-                resolutions: [
-                  [1280, 720, this.cameraFPS],
-                  [1024, 576, this.cameraFPS],
-                  [640, 360, this.cameraFPS],
-                ],
-                bitrates: [this.cameraMaxBitrate],
-              },
-              audio: {
-                codecs: [] // pas d'audio
-              }
-            }
-          });
-          accessory.configureController(controller);
-          accessory._hasCameraController = true;
-        }
+      case "CAMERA_WIFI":
+        // On laisse un service "CameraRTPStreamManagement" minimal comme avant,
+        // sans essayer d'implémenter tout le pipeline vidéo pour l'instant.
+        accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
         break;
-      }
 
       case "ON_OFF_PLUG": {
         const svc = accessory.addService(Service.Switch, accessory.displayName);
@@ -441,15 +521,15 @@ class SFRHomePlatform {
 
       case "LED_BULB_DIMMER":
       case "LED_BULB_HUE":
-      case "LED_BULB_COLOR": {
+      case "LED_BULB_COLOR":
         accessory.addService(Service.Lightbulb, accessory.displayName);
         break;
-      }
 
       default:
         accessory.addService(Service.MotionSensor, accessory.displayName);
     }
 
+    // Batterie
     const level = this._extractBatteryNormalized(d);
     const lowFlag = this._hasLowBatFlag(d);
     if (level !== null || lowFlag) {
@@ -472,6 +552,7 @@ class SFRHomePlatform {
     const getSV = (name) => d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
     const status = (d.status || "").toUpperCase();
 
+    // ALARM PANEL : lecture état (venant de devices.json)
     if ((d.deviceType || "").toUpperCase() === "ALARM_PANEL") {
       const svc = accessory.getService(Service.SecuritySystem);
       if (svc) {
@@ -483,17 +564,26 @@ class SFRHomePlatform {
         };
         const cur = curMap[modeRaw] ?? Characteristic.SecuritySystemCurrentState.DISARMED;
         svc.updateCharacteristic(Characteristic.SecuritySystemCurrentState, cur);
+
         let target;
         switch (cur) {
-          case Characteristic.SecuritySystemCurrentState.AWAY_ARM: target = Characteristic.SecuritySystemTargetState.AWAY_ARM; break;
-          case Characteristic.SecuritySystemCurrentState.NIGHT_ARM: target = Characteristic.SecuritySystemTargetState.NIGHT_ARM; break;
-          case Characteristic.SecuritySystemCurrentState.STAY_ARM:  target = Characteristic.SecuritySystemTargetState.STAY_ARM;  break;
-          default:                                                  target = Characteristic.SecuritySystemTargetState.DISARM;
+          case Characteristic.SecuritySystemCurrentState.AWAY_ARM:
+            target = Characteristic.SecuritySystemTargetState.AWAY_ARM;
+            break;
+          case Characteristic.SecuritySystemCurrentState.NIGHT_ARM:
+            target = Characteristic.SecuritySystemTargetState.NIGHT_ARM;
+            break;
+          case Characteristic.SecuritySystemCurrentState.STAY_ARM:
+            target = Characteristic.SecuritySystemTargetState.STAY_ARM;
+            break;
+          default:
+            target = Characteristic.SecuritySystemTargetState.DISARM;
         }
         svc.updateCharacteristic(Characteristic.SecuritySystemTargetState, target);
       }
     }
 
+    // Contact (sirènes/telecommandes/magnétiques)
     if (["MAGNETIC","REMOTE","KEYPAD","SOLAR_SIREN","SIREN"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.ContactSensor);
       if (svc) {
@@ -506,6 +596,7 @@ class SFRHomePlatform {
       }
     }
 
+    // Mouvement
     if ((d.deviceType || "").toUpperCase() === "PIR_DETECTOR") {
       const svc = accessory.getService(Service.MotionSensor);
       if (svc) {
@@ -514,6 +605,7 @@ class SFRHomePlatform {
       }
     }
 
+    // Fumée
     if ((d.deviceType || "").toUpperCase() === "SMOKE") {
       const svc = accessory.getService(Service.SmokeSensor);
       if (svc) {
@@ -526,6 +618,7 @@ class SFRHomePlatform {
       }
     }
 
+    // Temp/Hum
     if ((d.deviceType || "").toUpperCase() === "TEMP_HUM") {
       const tSvc = accessory.getService(Service.TemperatureSensor);
       const hSvc = accessory.getService(Service.HumiditySensor);
@@ -541,8 +634,9 @@ class SFRHomePlatform {
       }
     }
 
-    // Caméra: tout se fait au moment du stream (ffmpeg), rien à pousser au tick
+    // Caméra : rien ici pour l’instant (placeholder seulement)
 
+    // ON_OFF_PLUG: lecture de l’état réel à chaque tick
     if ((d.deviceType || "").toUpperCase() === "ON_OFF_PLUG") {
       const svc = accessory.getService(Service.Switch);
       if (svc) {
@@ -552,6 +646,7 @@ class SFRHomePlatform {
       }
     }
 
+    // SHUTTER_COMMAND : on se contente de refléter reachability
     if ((d.deviceType || "").toUpperCase() === "SHUTTER_COMMAND") {
       const svc = accessory.getService(Service.Switch);
       if (svc) {
@@ -560,6 +655,7 @@ class SFRHomePlatform {
       }
     }
 
+    // Lumières
     if (["LED_BULB_DIMMER","LED_BULB_HUE","LED_BULB_COLOR"].includes((d.deviceType || "").toUpperCase())) {
       const svc = accessory.getService(Service.Lightbulb);
       if (svc) {
@@ -569,121 +665,5 @@ class SFRHomePlatform {
         svc.updateCharacteristic(Characteristic.On, !!on);
       }
     }
-  }
-}
-
-// ---------- Délégué de streaming pour CameraController ----------
-class FFmpegStreamingDelegate {
-  constructor(platform, device) {
-    this.platform = platform;
-    this.device = device;
-    this.sessions = new Map();
-  }
-
-  async handleSnapshotRequest(request, callback) {
-    try {
-      const width = request.width || 640;
-      const height = request.height || 360;
-      const ff = spawn(this.platform.ffmpegPath, [
-        "-f", "lavfi", "-i", `color=black:s=${width}x${height}`,
-        "-frames:v", "1",
-        "-f", "mjpeg", "pipe:1",
-      ], { stdio: ["ignore", "pipe", "ignore"] });
-      const chunks = [];
-      ff.stdout.on("data", (c) => chunks.push(c));
-      ff.on("close", () => callback(undefined, Buffer.concat(chunks)));
-    } catch (e) {
-      this.platform.log.warn(`[SFR Home] Snapshot fallback: ${e.message}`);
-      callback(undefined, Buffer.alloc(0));
-    }
-  }
-
-  async prepareStream(request, callback) {
-    const sessionId = request.sessionID;
-    const video = request.video;
-    const response = {
-      video: {
-        port: video.port,
-        ssrc: this._randomSSRC(),
-        srtp_key: video.srtp_key,
-        srtp_salt: video.srtp_salt,
-      },
-      audio: undefined,
-    };
-    this.sessions.set(sessionId.toString("hex"), { request, response, ffmpeg: null });
-    callback(undefined, response);
-  }
-
-  async handleStreamRequest(request) {
-    const sessionIdHex = request.sessionID.toString("hex");
-    const session = this.sessions.get(sessionIdHex);
-
-    if (request.type === "start") {
-      const { video } = session.response;
-
-      const url = this.device.video_url
-        || (this.device.deviceMac
-              ? `https://home.sfr.fr/homescope/flv?localconn=0&mac=${this.device.deviceMac}&init=1`
-              : null);
-
-      if (!url) {
-        this.platform.log.error(`[SFR Home] Pas d'URL vidéo pour ${this.device.name}`);
-        return;
-      }
-
-      const srtp = Buffer.concat([video.srtp_key, video.srtp_salt]).toString("base64");
-      const target = `srtp://${request.targetAddress}:${video.port}?rtcpport=${video.port}&localrtcpport=${video.port}&pkt_size=1316`;
-
-      const headers = this.platform._buildVideoHeaders();
-
-      const args = [
-        "-hide_banner",
-        "-loglevel", "error",
-
-        "-headers", headers,
-
-        "-fflags", "nobuffer",
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "2",
-
-        "-i", url,
-
-        "-an",
-        "-vcodec", "libx264",
-        "-preset", "veryfast",
-        "-tune", "zerolatency",
-        "-pix_fmt", "yuv420p",
-        "-r", String(this.platform.cameraFPS),
-        "-b:v", `${this.platform.cameraMaxBitrate}k`,
-        "-bufsize", `${this.platform.cameraMaxBitrate}k`,
-        "-maxrate", `${this.platform.cameraMaxBitrate}k`,
-
-        "-f", "rtp",
-        "-payload_type", "99",
-        "-srtp_out_suite", "AES_CM_128_HMAC_SHA1_80",
-        "-srtp_out_params", srtp,
-        target
-      ];
-
-      this.platform.log.info(`[SFR Home] Start stream: ${this.device.name}`);
-      const ff = spawn(this.platform.ffmpegPath, args, { stdio: ["ignore", "ignore", "ignore"] });
-      session.ffmpeg = ff;
-      ff.on("close", (code) => {
-        this.platform.log.info(`[SFR Home] ffmpeg terminé (${this.device.name}) code=${code}`);
-      });
-
-    } else if (request.type === "stop") {
-      const ff = session?.ffmpeg;
-      if (ff && !ff.killed) {
-        ff.kill("SIGKILL");
-      }
-      this.sessions.delete(sessionIdHex);
-      this.platform.log.info(`[SFR Home] Stop stream: ${this.device.name}`);
-    }
-  }
-
-  _randomSSRC() {
-    return Math.floor(Math.random() * 0xffffffff);
   }
 }
