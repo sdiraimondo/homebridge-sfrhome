@@ -1,9 +1,13 @@
 // homebridge-sfrhome / index.js
-// v0.3.6 - ON_OFF_PLUG control via /plugcontrol + cookie-based auth + alarmmode control
+// v0.4.1 - Lecture directe /mysensors via cookies SSO,
+//          contrôle ON_OFF_PLUG via /plugcontrol,
+//          contrôle alarme via /alarmmode,
+//          ajout explicite de la Centrale (ALARM_PANEL) à partir de mysensors (name/model_type/alarm_mode)
 
 let hap;
 const fs = require("fs");
 const axios = require("axios");
+const xml2js = require("xml2js");
 
 const PLUGIN_NAME = "SFR Home pour Homebridge";
 const PLATFORM_NAME = "SFRHomePlatform";
@@ -20,13 +24,13 @@ class SFRHomePlatform {
     this.config = config || {};
     this.name = this.config.name || "SFR Home";
 
-    this.devicesPath = this.config.devicesPath || "/tmp/devices.json";
+    // rafraîchissement des états
     this.refreshSeconds = Number(this.config.refreshSeconds || 60);
 
     // Options d'exclusion (noms, modèles)
     this.exclude = this.config.exclude || {};
 
-    // Écriture (facultative) — API locale
+    // Écriture (API locale éventuelle)
     this.enableWrite = !!this.config.enableWrite;
     const base = this.config.controlBaseUrl || "http://127.0.0.1";
     const port = this.config.controlPort || 5000;
@@ -35,18 +39,14 @@ class SFRHomePlatform {
     // Chemin des cookies persistés (générés par le script Python)
     this.cookiePath = "/tmp/sfrhome_session_cookies.json";
 
-    // Périodicité de lecture d’état via plugcontrol (utilisée au tick global)
+    // Périodicité de lecture d’état via plugcontrol (optionnelle)
     this.plugPollMs = Number(this.config.plugPollMs || 30000);
 
     this.accessories = new Map();
 
-    if (!this.devicesPath) {
-      this.devicesPath = "/tmp/devices.json";
-    }
-
     this.api.on("didFinishLaunching", () => {
       this.log.info(
-        `Plateforme prête. Lecture: ${this.devicesPath}, refresh: ${this.refreshSeconds}s, write=${this.enableWrite ? "ON" : "OFF"}, control=${this.controlBaseUrl}`
+        `Plateforme prête. Source: https://home.sfr.fr/mysensors (cookies: ${this.cookiePath}), refresh: ${this.refreshSeconds}s, write=${this.enableWrite ? "ON" : "OFF"}, control=${this.controlBaseUrl}`
       );
       this._tick();
       this._interval = setInterval(() => this._tick(), this.refreshSeconds * 1000);
@@ -57,25 +57,18 @@ class SFRHomePlatform {
     this.accessories.set(accessory.UUID, accessory);
   }
 
-  _tick() {
-    fs.readFile(this.devicesPath, "utf8", (err, data) => {
-      if (err) {
-        this.log.warn(`Impossible de lire ${this.devicesPath}: ${err.message}`);
+  // ---------- Tick principal : fetch mysensors + reconcile ----------
+  async _tick() {
+    try {
+      const devices = await this._fetchDevicesFromSfr();
+      if (!devices || !Array.isArray(devices) || !devices.length) {
+        this.log.warn("[SFR Home] Aucun device récupéré via /mysensors.");
         return;
       }
-      let list;
-      try {
-        list = JSON.parse(data);
-      } catch (e) {
-        this.log.error(`JSON invalide: ${e.message}`);
-        return;
-      }
-      if (!Array.isArray(list)) {
-        this.log.warn("devices.json n'est pas une liste.");
-        return;
-      }
-      this._reconcile(list);
-    });
+      this._reconcile(devices);
+    } catch (e) {
+      this.log.error(`[SFR Home] Erreur tick: ${e.message}`);
+    }
   }
 
   // ---------- Helpers ----------
@@ -329,6 +322,226 @@ class SFRHomePlatform {
     }
   }
 
+  // ---------- Récupération + parsing /mysensors ----------
+  async _fetchDevicesFromSfr() {
+    const loadHeader = () => {
+      try {
+        const data = JSON.parse(fs.readFileSync(this.cookiePath, "utf8"));
+        const h = data.map(c => `${c.name}=${c.value}`).join("; ");
+        if (!h) throw new Error("cookie file empty");
+        return h;
+      } catch (e) {
+        throw new Error(`Cookies manquants/illisibles (${this.cookiePath}): ${e.message}`);
+      }
+    };
+
+    const doReq = async (cookieHeader) => {
+      const url = "https://home.sfr.fr/mysensors";
+      const headers = {
+        Cookie: cookieHeader,
+        Referer: "https://home.sfr.fr/accueil",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0",
+        Accept: "application/xml,text/xml,*/*"
+      };
+
+      const resp = await axios.get(url, {
+        headers,
+        responseType: "text",
+        maxRedirects: 0,
+        validateStatus: s => (s >= 200 && s < 300) || s === 302 || s === 303 || s === 403
+      });
+
+      if (resp.status === 403) {
+        throw new Error("403");
+      }
+      if (resp.status === 302 || resp.status === 303) {
+        throw new Error(`Redirection ${resp.status} (auth requise)`);
+      }
+
+      const xml = String(resp.data || "");
+      try {
+        fs.writeFileSync("/tmp/debug_mysensors.xml", xml);
+      } catch (e) {
+        this.log.warn(`[SFR Home] Impossible d'écrire /tmp/debug_mysensors.xml : ${e.message}`);
+      }
+      return await this._parseDevicesFromXml(xml);
+    };
+
+    try {
+      const ck = loadHeader();
+      return await doReq(ck);
+    } catch (e) {
+      if (String(e.message).includes("403")) {
+        this.log.warn("[SFR Home] 403 mysensors : relecture des cookies et nouvel essai...");
+        try {
+          const ck2 = loadHeader();
+          return await doReq(ck2);
+        } catch (e2) {
+          this.log.error(`[SFR Home] Échec final mysensors après reload cookies: ${e2.message}`);
+          return [];
+        }
+      }
+      this.log.error(`[SFR Home] Erreur mysensors: ${e.message}`);
+      return [];
+    }
+  }
+
+  async _parseDevicesFromXml(xml) {
+    let root;
+    try {
+      root = await xml2js.parseStringPromise(xml, {
+        explicitArray: false,
+        mergeAttrs: true,
+        trim: true
+      });
+    } catch (e) {
+      this.log.error(`[SFR Home] XML mysensors invalide: ${e.message}`);
+      return [];
+    }
+
+    // --- 1) Recherche générique des nœuds "device-like" dans tout l'arbre ---
+
+    const isDeviceLike = (obj) => {
+      if (!obj || typeof obj !== "object") return false;
+      const hasId = ["id", "uid", "rrd_id"].some(k => k in obj);
+      const hasTypeOrName = ["deviceType", "model_type", "modelType", "name", "deviceName"].some(k => k in obj);
+      return hasId && hasTypeOrName;
+    };
+
+    const found = [];
+
+    const visit = (node) => {
+      if (!node) return;
+      if (Array.isArray(node)) {
+        node.forEach(visit);
+        return;
+      }
+      if (typeof node !== "object") return;
+
+      if (isDeviceLike(node)) {
+        found.push(node);
+      }
+
+      if (node.device) {
+        visit(node.device);
+      }
+
+      for (const key of Object.keys(node)) {
+        if (key === "device") continue;
+        const val = node[key];
+        if (val && typeof val === "object") {
+          visit(val);
+        }
+      }
+    };
+
+    visit(root);
+
+    // --- 2) Déduplication des devices trouvés ---
+    const byId = new Map();
+    for (const dev of found) {
+      const sid =
+        (dev.id && String(dev.id)) ||
+        (dev.uid && String(dev.uid)) ||
+        (dev.rrd_id && String(dev.rrd_id)) ||
+        JSON.stringify(dev);
+      if (!byId.has(sid)) {
+        byId.set(sid, dev);
+      }
+    }
+
+    const arr = Array.from(byId.values());
+    const devices = [];
+
+    // --- 3) Transformation en objets "device" pour le plugin ---
+    for (const dev of arr) {
+      if (!dev) continue;
+
+      const sensorValues = {};
+      const svRaw = dev.sensorValue || dev.sensorValues || dev.sv || [];
+      const svArr = Array.isArray(svRaw) ? svRaw : (svRaw ? [svRaw] : []);
+
+      for (const sv of svArr) {
+        if (!sv) continue;
+        const name = sv.name || sv.Name || sv.id || "value";
+        const value =
+          sv.value !== undefined ? sv.value :
+          sv._ !== undefined ? sv._ :
+          sv.text !== undefined ? sv.text :
+          "";
+
+        const clone = { ...sv };
+        delete clone._;
+        delete clone.value;
+
+        sensorValues[name] = {
+          value: value,
+          attrs: clone
+        };
+      }
+
+      const d = {
+        id: dev.id || dev.uid || dev.rrd_id,
+        rrd_id: dev.rrd_id,
+        name: dev.name || dev.label || dev.deviceName,
+        deviceType: dev.deviceType || dev.model_type || dev.modelType,
+        model_type: dev.model_type || dev.modelType || "",
+        status: dev.status || dev.deviceStatus || "",
+        brand: dev.brand || "",
+        deviceModel: dev.deviceModel || dev.model || "",
+        deviceVersion: dev.deviceVersion || dev.version || "",
+        batteryLevel: dev.batteryLevel,
+        deviceMac: dev.deviceMac || dev.mac || "",
+        sensorValues
+      };
+
+      devices.push(d);
+    }
+
+    // --- 4) Ajout explicite de la Centrale (ALARM_PANEL) si présente dans les attributs racine ---
+
+    const rootMs = root.mysensors || root; // selon la structure réelle
+    if (rootMs && rootMs.model_type === "TSC06SFR") {
+      const centraleName = rootMs.name || "Centrale";
+      const alarmMode = (rootMs.alarm_mode || "OFF").toUpperCase();
+
+      const already = devices.find(
+        dev => (dev.deviceType || "").toUpperCase() === "ALARM_PANEL"
+      );
+
+      if (!already) {
+        const centraleDevice = {
+          id: "ALARM_PANEL_MAIN",
+          rrd_id: null,
+          name: centraleName,
+          deviceType: "ALARM_PANEL",
+          model_type: rootMs.model_type,
+          status: alarmMode,
+          brand: "SFR HOME",
+          deviceModel: rootMs.model_type,
+          deviceVersion: "",
+          batteryLevel: null,
+          deviceMac: "",
+          sensorValues: {
+            AlarmMode: {
+              value: alarmMode,
+              attrs: {}
+            }
+          }
+        };
+        devices.push(centraleDevice);
+        this.log.info(`[SFR Home] Centrale détectée et ajoutée: ${centraleName} (mode=${alarmMode})`);
+      }
+    }
+
+    if (this.log.debug) {
+      this.log.debug(`[SFR Home] mysensors -> ${devices.length} devices parsés (après récursion + centrale).`);
+    }
+
+    return devices;
+  }
+
   // ---------- Cycle principal d'ajout des devices ----------
   _reconcile(devices) {
     const seen = new Set();
@@ -370,7 +583,6 @@ class SFRHomePlatform {
       this._updateValues(accessory, d);
     }
 
-    // Retire les devices qui n'existent plus
     const toRemove = [];
     for (const [uuid, acc] of this.accessories.entries()) {
       if (!seen.has(uuid)) {
@@ -388,7 +600,6 @@ class SFRHomePlatform {
   _setupServices(accessory, d) {
     const Service = hap.Service, Characteristic = hap.Characteristic;
 
-    // On repart propre à chaque tick (hors AccessoryInformation)
     accessory.services
       .filter((s) => !(s instanceof Service.AccessoryInformation))
       .forEach((s) => accessory.removeService(s));
@@ -406,43 +617,35 @@ class SFRHomePlatform {
       case "ALARM_PANEL": {
         const svc = accessory.addService(Service.SecuritySystem, accessory.displayName);
 
-        // Handler HomeKit -> SFR (pilotage alarme)
+        // Mapping demandé :
+        // - Activité (SFR) = Absent (AWAY_ARM) -> "on"
+        // - Nuit (SFR)     = Nuit (NIGHT_ARM) -> "custom"
+        // - Désactivé      = Off (DISARM) et Maison (STAY_ARM) -> "off"
         svc.getCharacteristic(Characteristic.SecuritySystemTargetState)
           .on("set", async (value, callback) => {
-              // Map HomeKit -> mode SFR
-              let mode = "off";
-              switch (value) {
-                case Characteristic.SecuritySystemTargetState.DISARM:
-                  // Off -> Désactivé
-                  mode = "off";
-                  break;
-        
-                case Characteristic.SecuritySystemTargetState.STAY_ARM:
-                  // Maison -> Désactivé (même comportement que Off)
-                  mode = "off";
-                  break;
-        
-                case Characteristic.SecuritySystemTargetState.NIGHT_ARM:
-                  // Nuit -> Custom
-                  mode = "custom";
-                  break;
-        
-                case Characteristic.SecuritySystemTargetState.AWAY_ARM:
-                  // Absent -> Activité (ON)
-                  mode = "on";
-                  break;
-        
-                default:
-                  // Par défaut, on joue la sécurité : off
-                  mode = "off";
-                  break;
+            let mode = "off";
+            switch (value) {
+              case Characteristic.SecuritySystemTargetState.DISARM:
+                mode = "off";
+                break;
+              case Characteristic.SecuritySystemTargetState.STAY_ARM:
+                mode = "off";     // Maison => Désactivé
+                break;
+              case Characteristic.SecuritySystemTargetState.NIGHT_ARM:
+                mode = "custom";  // Nuit => Custom
+                break;
+              case Characteristic.SecuritySystemTargetState.AWAY_ARM:
+                mode = "on";      // Absent => Activité
+                break;
+              default:
+                mode = "off";
+                break;
             }
 
             try {
               await this._alarmAction(mode);
               this.log.info(`[SFR Home] Alarme -> ${mode.toUpperCase()}`);
 
-              // Feedback immédiat côté HomeKit (current state)
               const curMap = {
                 "off": Characteristic.SecuritySystemCurrentState.DISARMED,
                 "custom": Characteristic.SecuritySystemCurrentState.NIGHT_ARM,
@@ -483,8 +686,7 @@ class SFRHomePlatform {
         break;
 
       case "CAMERA_WIFI":
-        // On laisse un service "CameraRTPStreamManagement" minimal comme avant,
-        // sans essayer d'implémenter tout le pipeline vidéo pour l'instant.
+        // Placeholder minimal (on laisse pour plus tard)
         accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
         break;
 
@@ -541,7 +743,7 @@ class SFRHomePlatform {
         hap.Characteristic.StatusLowBattery,
         (level !== null ? (level <= 20) : lowFlag)
           ? hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
-          : hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
+          : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
       );
     }
   }
@@ -552,7 +754,7 @@ class SFRHomePlatform {
     const getSV = (name) => d.sensorValues && d.sensorValues[name] ? d.sensorValues[name].value : undefined;
     const status = (d.status || "").toUpperCase();
 
-    // ALARM PANEL : lecture état (venant de devices.json)
+    // ALARM PANEL : lecture état depuis mysensors
     if ((d.deviceType || "").toUpperCase() === "ALARM_PANEL") {
       const svc = accessory.getService(Service.SecuritySystem);
       if (svc) {
@@ -634,8 +836,6 @@ class SFRHomePlatform {
       }
     }
 
-    // Caméra : rien ici pour l’instant (placeholder seulement)
-
     // ON_OFF_PLUG: lecture de l’état réel à chaque tick
     if ((d.deviceType || "").toUpperCase() === "ON_OFF_PLUG") {
       const svc = accessory.getService(Service.Switch);
@@ -646,7 +846,7 @@ class SFRHomePlatform {
       }
     }
 
-    // SHUTTER_COMMAND : on se contente de refléter reachability
+    // SHUTTER_COMMAND : on reflète juste la reachability
     if ((d.deviceType || "").toUpperCase() === "SHUTTER_COMMAND") {
       const svc = accessory.getService(Service.Switch);
       if (svc) {
