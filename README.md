@@ -10,28 +10,25 @@ Ne fonctionne pour l'instant qu'avec un abonnement SFR Home.
 ## Fonctionnalités
 - Récupération des périphériques SFR Home (contact, mouvement, fumée, température, humidité, ...) et des partenaires Hue, Legrand ou Netamo
 - Récupération du statut de l'alarme dans un device spécifique (Centrale)
-- Exclusion de certains périphériques par nom ou par type (Météo, Hue…) dans le fichier config.json (permettant d'éviter les doublons si les périphériques sont déjà présents dans Homekit)
-- Création d'une version alternative sans abonnement
+- Exclusion de certains périphériques par nom ou par type (Météo, Hue…) dans le fichier config.json (permettant d'éviter les doublons si les périphériques sont déjà présents dans Homekit via un autre plugin)
+- Pilotage des prises commandées On/Off
 
 A venir :
-- Pilotage des devices (via Flask ?)
+- Pilotage des autres devices
 - Flux Camera (peut-être possible en local directement)
+- Création d'une version alternative sans abonnement ?
 
 ## Installation
 ```bash
-# Install des dépendances (selon votre distribution)
-pip install requests lxml beautifulsoup4
-
-## ou
-apt install python3 python3-requests python3-lxml python3-bs4
 
 # Clone dans le dossier node_modules de Homebridge et install des dépendances
 git clone https://github.com/sdiraimondo/homebridge-sfrhome
 cd ./homebridge-sfrhome
 sudo ./install_sfrhome.sh --user nom@domaine.com --password 'Password12345!' --cron-user homebridge
 
+npm install
 npm pack
-sudo npm install -g ./homebridge-sfrhome-0.4.0.tgz
+sudo npm install -g ./homebridge-sfrhome-*.tgz
 
 # ou
 sudo npm link
