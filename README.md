@@ -4,8 +4,8 @@ Plugin Homebridge exposant les équipements **SFR HOME** à HomeKit via scrappin
 Ne fonctionne pour l'instant qu'avec un abonnement SFR Home.
 
 ## Fonctionnement
-- Scrapping du site home.sfr.fr toutes les 2 minutes (via script python) et traitement en local
-- Connexion : Cookies pour limiter le nombre de connexions, le login/password est utilisé pour la première connexion puis lors de l'expiration des cookies  
+- Scrapping du site home.sfr.fr
+- Connexion : Cookies pour limiter le nombre de connexions, le login/password est utilisé pour la première connexion puis lors de l'expiration des cookies.
 
 ## Fonctionnalités
 - Récupération des périphériques SFR Home (contact, mouvement, fumée, température, humidité, ...) et des partenaires Hue, Legrand ou Netamo
