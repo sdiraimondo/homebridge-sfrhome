@@ -1,11 +1,12 @@
 # SFR Home pour Homebridge
 
-Plugin Homebridge exposant les équipements **SFR HOME** à HomeKit via scrapping du site SFR Home (script Python).
+Plugin Homebridge exposant les équipements **SFR HOME** à HomeKit via l'API/Site SFR Home.
 Ne fonctionne pour l'instant qu'avec un abonnement SFR Home.
 
 ## Fonctionnement
 - Scrapping du site home.sfr.fr
-- Connexion : Cookies pour limiter le nombre de connexions, le login/password est utilisé pour la première connexion puis lors de l'expiration des cookies.
+- Authentification SSO intégrée directement dans le plugin (plus besoin de script Python externe ou de cron)
+- Connexion : Cookies persistés avec réauthentification automatique en cas d'expiration
 
 ## Fonctionnalités
 - Récupération des périphériques SFR Home (contact, mouvement, fumée, température, humidité, ...) et des partenaires Hue, Legrand ou Netamo
@@ -24,7 +25,6 @@ A venir :
 # Clone dans le dossier node_modules de Homebridge et install des dépendances
 git clone https://github.com/sdiraimondo/homebridge-sfrhome
 cd ./homebridge-sfrhome
-sudo ./install_sfrhome.sh --user nom@domaine.com --password 'Password12345!' --cron-user homebridge
 
 npm install
 npm pack
@@ -36,12 +36,16 @@ sudo npm link homebridge-sfrhome
 
 ```
 
+**Note:** L'authentification est maintenant intégrée au plugin. Plus besoin du script Python et du cron - il suffit de renseigner `username` et `password` dans la configuration. Les anciens scripts (`sfr_mysensors_sso.py`, `install_sfrhome.sh`) restent présents pour compatibilité mais ne sont plus nécessaires.
+
 ## Configuration du plugin dans Config.json
 ```
 {
     "platform": "SFRHomePlatform",
     "name": "SFR Home",
-    "devicesPath": "/tmp/devices.json",
+    "username": "votre.email@sfr.fr",
+    "password": "votre_mot_de_passe",
+    "cookiePath": "/tmp/sfrhome_session_cookies.json",
     "refreshSeconds": 30,
     "exclude": {
         "names": [

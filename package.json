@@ -25,6 +25,7 @@
   "license": "MIT",
   "dependencies": {
     "axios": "^1.6.2",
+    "cheerio": "^1.2.0",
     "xml2js": "^0.6.0"
   },
   "deprecated": false,
@@ -32,4 +33,3 @@
     "homebridge": ">=1.6.0"
   }
 }
-

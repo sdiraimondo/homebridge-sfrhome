@@ -1,5 +1,6 @@
 // homebridge-sfrhome / index.js
-// v0.4.1 - Lecture directe /mysensors via cookies SSO,
+// v0.5.0 - Authentification SSO intégrée (sans dépendance Python/cron),
+//          lecture directe /mysensors via cookies SSO,
 //          contrôle ON_OFF_PLUG via /plugcontrol,
 //          contrôle alarme via /alarmmode,
 //          ajout explicite de la Centrale (ALARM_PANEL) à partir de mysensors (name/model_type/alarm_mode)
@@ -8,6 +9,7 @@ let hap;
 const fs = require("fs");
 const axios = require("axios");
 const xml2js = require("xml2js");
+const SFRAuth = require("./auth");
 
 const PLUGIN_NAME = "SFR Home pour Homebridge";
 const PLATFORM_NAME = "SFRHomePlatform";
@@ -36,17 +38,24 @@ class SFRHomePlatform {
     const port = this.config.controlPort || 5000;
     this.controlBaseUrl = `${base.replace(/\/$/, "")}:${port}`;
 
-    // Chemin des cookies persistés (générés par le script Python)
-    this.cookiePath = "/tmp/sfrhome_session_cookies.json";
+    // Chemin des cookies persistés
+    this.cookiePath = this.config.cookiePath || "/tmp/sfrhome_session_cookies.json";
 
     // Périodicité de lecture d’état via plugcontrol (optionnelle)
     this.plugPollMs = Number(this.config.plugPollMs || 30000);
+
+    // Authentification intégrée
+    this.auth = new SFRAuth(log, {
+      username: this.config.username || this.config.email,
+      password: this.config.password,
+      cookiePath: this.cookiePath
+    });
 
     this.accessories = new Map();
 
     this.api.on("didFinishLaunching", () => {
       this.log.info(
-        `Plateforme prête. Source: https://home.sfr.fr/mysensors (cookies: ${this.cookiePath}), refresh: ${this.refreshSeconds}s, write=${this.enableWrite ? "ON" : "OFF"}, control=${this.controlBaseUrl}`
+        `Plateforme prête. Source: https://home.sfr.fr/mysensors (auth intégrée, cookies: ${this.cookiePath}), refresh: ${this.refreshSeconds}s, write=${this.enableWrite ? "ON" : "OFF"}, control=${this.controlBaseUrl}`
       );
       this._tick();
       this._interval = setInterval(() => this._tick(), this.refreshSeconds * 1000);
@@ -181,9 +190,15 @@ class SFRHomePlatform {
     return null;
   }
 
-  // ---------- Cookies & appels SFR ----------
+  // ---------- Authentification intégrée ----------
   _loadCookiesHeader() {
     try {
+      if (this.auth) {
+        const cookies = this.auth.loadCookies();
+        if (cookies && cookies.length) {
+          return this.auth.cookiesToHeader(cookies);
+        }
+      }
       const data = JSON.parse(fs.readFileSync(this.cookiePath, "utf8"));
       const header = data.map(c => `${c.name}=${c.value}`).join("; ");
       if (!header) throw new Error("cookie file empty");
@@ -196,35 +211,38 @@ class SFRHomePlatform {
 
   // Contrôle des prises ON_OFF_PLUG via /plugcontrol
   async _plugAction(uid, action = null) {
-    const loadHeader = () => {
-      try {
-        const data = JSON.parse(fs.readFileSync(this.cookiePath, "utf8"));
-        const h = data.map(c => `${c.name}=${c.value}`).join("; ");
-        if (!h) throw new Error("cookie file empty");
-        return h;
-      } catch (e) {
-        throw new Error(`Cookies manquants/illisibles (${this.cookiePath}): ${e.message}`);
-      }
-    };
-
-    const doReq = async (cookieHeader) => {
+    const doReq = async () => {
       const url = action
         ? `https://home.sfr.fr/plugcontrol?uid=${encodeURIComponent(uid)}&action=${action}`
         : `https://home.sfr.fr/plugcontrol?uid=${encodeURIComponent(uid)}`;
 
-      const headers = {
-        Cookie: cookieHeader,
-        Referer: "https://home.sfr.fr/accueil",
-        "X-Requested-With": "XMLHttpRequest",
-        "User-Agent": "Mozilla/5.0",
-        Accept: "application/xml,text/xml,*/*"
-      };
-
-      const resp = await axios.get(url, {
-        headers,
-        maxRedirects: 0,
-        validateStatus: s => (s >= 200 && s < 300) || s === 302 || s === 303 || s === 403
-      });
+      let resp;
+      if (this.auth && typeof this.auth.makeRequest === "function") {
+        resp = await this.auth.makeRequest(url, {
+          headers: {
+            Referer: "https://home.sfr.fr/accueil",
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": "Mozilla/5.0",
+            Accept: "application/xml,text/xml,*/*"
+          },
+          maxRedirects: 0,
+          validateStatus: s => (s >= 200 && s < 300) || s === 302 || s === 303 || s === 403
+        });
+      } else {
+        const ck = this._loadCookiesHeader();
+        if (!ck) throw new Error("No cookies available");
+        resp = await axios.get(url, {
+          headers: {
+            Cookie: ck,
+            Referer: "https://home.sfr.fr/accueil",
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": "Mozilla/5.0",
+            Accept: "application/xml,text/xml,*/*"
+          },
+          maxRedirects: 0,
+          validateStatus: s => (s >= 200 && s < 300) || s === 302 || s === 303 || s === 403
+        });
+      }
 
       if (resp.status === 403) {
         throw new Error("403");
@@ -239,16 +257,15 @@ class SFRHomePlatform {
     };
 
     try {
-      const ck = loadHeader();
-      return await doReq(ck);
+      return await doReq();
     } catch (e) {
-      if (String(e.message).includes("403")) {
-        this.log.warn("[SFR Home] 403 plugcontrol : relecture des cookies et nouvel essai...");
+      if (String(e.message).includes("403") && this.auth) {
+        this.log.warn("[SFR Home] 403 plugcontrol : réauthentification...");
         try {
-          const ck2 = loadHeader();
-          return await doReq(ck2);
+          await this.auth.doSSO();
+          return await doReq();
         } catch (e2) {
-          throw new Error(`403 après reload cookies. Vérifie que ${this.cookiePath} est à jour et lisible (cron). Détail: ${e2.message}`);
+          throw new Error(`403 après réauthentification. Détail: ${e2.message}`);
         }
       }
       throw e;
@@ -262,33 +279,36 @@ class SFRHomePlatform {
       throw new Error(`Mode alarme invalide: ${mode}`);
     }
 
-    const loadHeader = () => {
-      try {
-        const data = JSON.parse(fs.readFileSync(this.cookiePath, "utf8"));
-        const h = data.map(c => `${c.name}=${c.value}`).join("; ");
-        if (!h) throw new Error("cookie file empty");
-        return h;
-      } catch (e) {
-        throw new Error(`Cookies manquants/illisibles (${this.cookiePath}): ${e.message}`);
-      }
-    };
-
-    const doReq = async (cookieHeader) => {
+    const doReq = async () => {
       const url = `https://home.sfr.fr/alarmmode?action=${encodeURIComponent(modeNorm)}`;
 
-      const headers = {
-        Cookie: cookieHeader,
-        Referer: "https://home.sfr.fr/accueil",
-        "X-Requested-With": "XMLHttpRequest",
-        "User-Agent": "Mozilla/5.0",
-        Accept: "application/xml,text/xml,*/*"
-      };
-
-      const resp = await axios.get(url, {
-        headers,
-        maxRedirects: 0,
-        validateStatus: s => (s >= 200 && s < 300) || s === 302 || s === 303 || s === 403
-      });
+      let resp;
+      if (this.auth && typeof this.auth.makeRequest === "function") {
+        resp = await this.auth.makeRequest(url, {
+          headers: {
+            Referer: "https://home.sfr.fr/accueil",
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": "Mozilla/5.0",
+            Accept: "application/xml,text/xml,*/*"
+          },
+          maxRedirects: 0,
+          validateStatus: s => (s >= 200 && s < 300) || s === 302 || s === 303 || s === 403
+        });
+      } else {
+        const ck = this._loadCookiesHeader();
+        if (!ck) throw new Error("No cookies available");
+        resp = await axios.get(url, {
+          headers: {
+            Cookie: ck,
+            Referer: "https://home.sfr.fr/accueil",
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": "Mozilla/5.0",
+            Accept: "application/xml,text/xml,*/*"
+          },
+          maxRedirects: 0,
+          validateStatus: s => (s >= 200 && s < 300) || s === 302 || s === 303 || s === 403
+        });
+      }
 
       if (resp.status === 403) {
         throw new Error("403");
@@ -306,16 +326,15 @@ class SFRHomePlatform {
     };
 
     try {
-      const ck = loadHeader();
-      return await doReq(ck);
+      return await doReq();
     } catch (e) {
-      if (String(e.message).includes("403")) {
-        this.log.warn("[SFR Home] 403 alarmmode : relecture des cookies et nouvel essai...");
+      if (String(e.message).includes("403") && this.auth) {
+        this.log.warn("[SFR Home] 403 alarmmode : réauthentification...");
         try {
-          const ck2 = loadHeader();
-          return await doReq(ck2);
+          await this.auth.doSSO();
+          return await doReq();
         } catch (e2) {
-          throw new Error(`403 après reload cookies (alarmmode). Vérifie que ${this.cookiePath} est à jour et lisible. Détail: ${e2.message}`);
+          throw new Error(`403 après réauthentification (alarmmode). Détail: ${e2.message}`);
         }
       }
       throw e;
@@ -324,33 +343,38 @@ class SFRHomePlatform {
 
   // ---------- Récupération + parsing /mysensors ----------
   async _fetchDevicesFromSfr() {
-    const loadHeader = () => {
-      try {
-        const data = JSON.parse(fs.readFileSync(this.cookiePath, "utf8"));
-        const h = data.map(c => `${c.name}=${c.value}`).join("; ");
-        if (!h) throw new Error("cookie file empty");
-        return h;
-      } catch (e) {
-        throw new Error(`Cookies manquants/illisibles (${this.cookiePath}): ${e.message}`);
-      }
-    };
-
-    const doReq = async (cookieHeader) => {
+    const doReq = async () => {
       const url = "https://home.sfr.fr/mysensors";
-      const headers = {
-        Cookie: cookieHeader,
-        Referer: "https://home.sfr.fr/accueil",
-        "X-Requested-With": "XMLHttpRequest",
-        "User-Agent": "Mozilla/5.0",
-        Accept: "application/xml,text/xml,*/*"
-      };
 
-      const resp = await axios.get(url, {
-        headers,
-        responseType: "text",
-        maxRedirects: 0,
-        validateStatus: s => (s >= 200 && s < 300) || s === 302 || s === 303 || s === 403
-      });
+      let resp;
+      if (this.auth && typeof this.auth.makeRequest === "function") {
+        resp = await this.auth.makeRequest(url, {
+          headers: {
+            Referer: "https://home.sfr.fr/accueil",
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": "Mozilla/5.0",
+            Accept: "application/xml,text/xml,*/*"
+          },
+          responseType: "text",
+          maxRedirects: 0,
+          validateStatus: s => (s >= 200 && s < 300) || s === 302 || s === 303 || s === 403
+        });
+      } else {
+        const ck = this._loadCookiesHeader();
+        if (!ck) throw new Error("No cookies available");
+        resp = await axios.get(url, {
+          headers: {
+            Cookie: ck,
+            Referer: "https://home.sfr.fr/accueil",
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": "Mozilla/5.0",
+            Accept: "application/xml,text/xml,*/*"
+          },
+          responseType: "text",
+          maxRedirects: 0,
+          validateStatus: s => (s >= 200 && s < 300) || s === 302 || s === 303 || s === 403
+        });
+      }
 
       if (resp.status === 403) {
         throw new Error("403");
@@ -369,16 +393,15 @@ class SFRHomePlatform {
     };
 
     try {
-      const ck = loadHeader();
-      return await doReq(ck);
+      return await doReq();
     } catch (e) {
-      if (String(e.message).includes("403")) {
-        this.log.warn("[SFR Home] 403 mysensors : relecture des cookies et nouvel essai...");
+      if (String(e.message).includes("403") && this.auth) {
+        this.log.warn("[SFR Home] 403 mysensors : réauthentification...");
         try {
-          const ck2 = loadHeader();
-          return await doReq(ck2);
+          await this.auth.doSSO();
+          return await doReq();
         } catch (e2) {
-          this.log.error(`[SFR Home] Échec final mysensors après reload cookies: ${e2.message}`);
+          this.log.error(`[SFR Home] Échec final mysensors après réauthentification: ${e2.message}`);
           return [];
         }
       }
