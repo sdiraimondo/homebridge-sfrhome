@@ -98,7 +98,8 @@ class SFRHomePlatform {
       case "LED_BULB_COLOR": return c.LIGHTBULB;
       case "CAMERA_WIFI": return c.CAMERA;
       case "ON_OFF_PLUG": return c.SWITCH;
-      case "SHUTTER_COMMAND": return c.SWITCH;
+      case "SHUTTER_COMMAND":
+      case "SHUTTER_CONTROL": return c.WINDOW_COVERING;
       default: return c.OTHER;
     }
   }
@@ -741,8 +742,35 @@ class SFRHomePlatform {
       }
 
       case "SHUTTER_COMMAND":
-        accessory.addService(Service.Switch, accessory.displayName);
+      case "SHUTTER_CONTROL": {
+        const svc = accessory.addService(Service.WindowCovering, accessory.displayName);
+        if (!svc._sfrShutterBound) {
+          svc.getCharacteristic(Characteristic.TargetPosition)
+            .on("set", async (value, callback) => {
+              try {
+                // SFR uses different APIs - try via plugcontrol style or generic action
+                // For now, use on/off based on position
+                if (value >= 50) {
+                  await this._plugAction(d.id, "on").catch(() => {});
+                } else {
+                  await this._plugAction(d.id, "off").catch(() => {});
+                }
+                this.log.info(`[SFR Home] ${d.name} -> position ${value}%`);
+                svc.updateCharacteristic(Characteristic.CurrentPosition, value);
+                svc.updateCharacteristic(Characteristic.PositionState, Characteristic.PositionState.STOPPED);
+                callback();
+              } catch (e) {
+                this.log.error(`[SFR Home] Erreur volet ${d.name}: ${e.message}`);
+                callback(e);
+              }
+            });
+          svc.setCharacteristic(Characteristic.CurrentPosition, 100);
+          svc.setCharacteristic(Characteristic.TargetPosition, 100);
+          svc.setCharacteristic(Characteristic.PositionState, Characteristic.PositionState.STOPPED);
+          svc._sfrShutterBound = true;
+        }
         break;
+      }
 
       case "LED_BULB_DIMMER":
       case "LED_BULB_HUE":
@@ -869,12 +897,14 @@ class SFRHomePlatform {
       }
     }
 
-    // SHUTTER_COMMAND : on reflète juste la reachability
-    if ((d.deviceType || "").toUpperCase() === "SHUTTER_COMMAND") {
-      const svc = accessory.getService(Service.Switch);
+    // SHUTTER_COMMAND/SHUTTER_CONTROL : WindowCovering
+    if (["SHUTTER_COMMAND", "SHUTTER_CONTROL"].includes((d.deviceType || "").toUpperCase())) {
+      const svc = accessory.getService(Service.WindowCovering);
       if (svc) {
         const reachable = status !== "UNREACHABLE";
-        svc.updateCharacteristic(Characteristic.On, reachable);
+        if (!reachable) {
+          svc.updateCharacteristic(Characteristic.PositionState, Characteristic.PositionState.STOPPED);
+        }
       }
     }
 
