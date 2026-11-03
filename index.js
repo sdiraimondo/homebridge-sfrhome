@@ -709,10 +709,12 @@ class SFRHomePlatform {
         accessory.addService(Service.HumiditySensor, accessory.displayName + " (Hum)");
         break;
 
-      case "CAMERA_WIFI":
-        // Placeholder minimal (on laisse pour plus tard)
+      case "CAMERA_WIFI": {
         accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
+        // Add motion sensor for detection if available
+        accessory.addService(Service.MotionSensor, accessory.displayName + " (Motion)");
         break;
+      }
 
       case "ON_OFF_PLUG": {
         const svc = accessory.addService(Service.Switch, accessory.displayName);
@@ -950,6 +952,15 @@ class SFRHomePlatform {
         let on = this._findOnOffInSensorValues(d);
         if (on === null) on = reachable;
         svc.updateCharacteristic(Characteristic.On, !!on);
+      }
+    }
+
+    // Caméra - mouvement si détecté
+    if ((d.deviceType || "").toUpperCase() === "CAMERA_WIFI") {
+      const motionSvc = accessory.getService(Service.MotionSensor);
+      if (motionSvc) {
+        const motion = status === "TRIGGERED" || status === "MOTION";
+        motionSvc.updateCharacteristic(Characteristic.MotionDetected, motion);
       }
     }
   }
