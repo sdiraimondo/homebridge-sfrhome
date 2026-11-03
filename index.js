@@ -774,9 +774,43 @@ class SFRHomePlatform {
 
       case "LED_BULB_DIMMER":
       case "LED_BULB_HUE":
-      case "LED_BULB_COLOR":
-        accessory.addService(Service.Lightbulb, accessory.displayName);
+      case "LED_BULB_COLOR": {
+        const svc = accessory.addService(Service.Lightbulb, accessory.displayName);
+        if (!svc._sfrLightBound) {
+          svc.getCharacteristic(Characteristic.On)
+            .on("set", async (value, callback) => {
+              try {
+                // Try bulb control endpoint
+                const action = value ? "on" : "off";
+                await this._plugAction(d.id, action).catch(async () => {
+                  // Fallback to bulb action
+                  const url = `https://home.sfr.fr/bulbcontrol?uid=${encodeURIComponent(d.id)}&action=${action}`;
+                  if (this.auth && typeof this.auth.makeRequest === "function") {
+                    await this.auth.makeRequest(url, {
+                      headers: { Referer: "https://home.sfr.fr/accueil", "X-Requested-With": "XMLHttpRequest" },
+                      validateStatus: () => true
+                    });
+                  }
+                });
+                this.log.info(`[SFR Home] ${d.name} (light) -> ${value ? "ON" : "OFF"}`);
+                callback();
+              } catch (e) {
+                this.log.error(`[SFR Home] Erreur lumière ${d.name}: ${e.message}`);
+                callback(e);
+              }
+            })
+            .on("get", async (callback) => {
+              try {
+                const on = this._findOnOffInSensorValues(d);
+                callback(null, on === null ? true : on);
+              } catch (e) {
+                callback(e);
+              }
+            });
+          svc._sfrLightBound = true;
+        }
         break;
+      }
 
       default:
         accessory.addService(Service.MotionSensor, accessory.displayName);
