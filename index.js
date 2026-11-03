@@ -713,6 +713,12 @@ class SFRHomePlatform {
         accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
         // Add motion sensor for detection if available
         accessory.addService(Service.MotionSensor, accessory.displayName + " (Motion)");
+        // Store camera info for potential streaming
+        const mac = d.deviceMac || d.mac || "";
+        if (mac) {
+          accessory.context.cameraMac = mac;
+          accessory.context.streamUrl = `https://home.sfr.fr/homescope/flv?localconn=0&mac=${mac}`;
+        }
         break;
       }
 
