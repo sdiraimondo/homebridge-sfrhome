@@ -64,10 +64,10 @@ class SFRHomeCamera {
   }
   
   handleSnapshotRequest(request, callback) {
-    this.log.debug(`[Camera ${this.accessory.displayName}] Snapshot request`);
+    this.log.debug('[Camera ' + this.accessory.displayName + '] Snapshot request');
     // Try to get snapshot from SFR
     const axios = require('axios');
-    const snapshotUrl = `https://home.sfr.fr/homescope/snapshot?mac=${this.mac}`;
+    const snapshotUrl = 'https://home.sfr.fr/homescope/snapshot?mac=' + this.mac + '';
     
     this.platform.auth.makeRequest(snapshotUrl, {
       responseType: 'arraybuffer',
@@ -80,7 +80,7 @@ class SFRHomeCamera {
         callback(new Error('Failed to get snapshot'));
       }
     }).catch(err => {
-      this.log.error(`[Camera ${this.accessory.displayName}] Snapshot error: ${err.message}`);
+      this.log.error('[Camera ' + this.accessory.displayName + '] Snapshot error: ${err.message}');
       callback(err);
     });
   }
@@ -134,7 +134,7 @@ class SFRHomeCamera {
         return;
       }
       
-      this.log.info(`[Camera ${this.accessory.displayName}] Starting stream from ${this.streamUrl}`);
+      this.log.info('[Camera ' + this.accessory.displayName + '] Starting stream from ${this.streamUrl}');
       
       const ffmpegArgs = [
         '-i', this.streamUrl,
@@ -147,13 +147,13 @@ class SFRHomeCamera {
         '-r', '30',
         '-g', '60',
         '-sc_threshold', '0',
-        '-s', `${request.video.width}x${request.video.height}`,
-        '-b:v', `${request.video.max_bit_rate}k`,
-        '-bufsize', `${request.video.max_bit_rate * 2}k`,
-        '-maxrate', `${request.video.max_bit_rate}k',
+        '-s', '' + request.video.width + 'x${request.video.height}',
+        '-b:v', '' + request.video.max_bit_rate + 'k',
+        '-bufsize', '' + request.video.max_bit_rate * 2 + 'k',
+        '-maxrate', '' + request.video.max_bit_rate + 'k',
         '-f', 'rtp',
-        `-sdp_file`, `/tmp/${request.sessionID}.sdp`,
-        `rtp://${sessionInfo.address}:${request.video.port}?rtcpport=${request.video.port}&localrtcpport=${request.video.port}&pkt_size=1316`
+        '-sdp_file', '/tmp/' + request.sessionID + '.sdp',
+        'rtp://' + sessionInfo.address + ':' + request.video.port + '?rtcpport=' + request.video.port + '&localrtcpport=' + request.video.port + '&pkt_size=1316'
       ];
       
       const { spawn } = require('child_process');
@@ -162,15 +162,15 @@ class SFRHomeCamera {
       this.pendingSessions.set(request.sessionID, { ...sessionInfo, ffmpeg });
       
       ffmpeg.stderr.on('data', (data) => {
-        this.log.debug(`[Camera ${this.accessory.displayName}] ffmpeg: ${data.toString()}`);
+        this.log.debug('[Camera ' + this.accessory.displayName + '] ffmpeg: ' + data.toString());
       });
       
       ffmpeg.on('error', (err) => {
-        this.log.error(`[Camera ${this.accessory.displayName}] ffmpeg error: ${err.message}`);
+        this.log.error('[Camera ' + this.accessory.displayName + '] ffmpeg error: ${err.message}');
       });
       
       ffmpeg.on('close', (code) => {
-        this.log.debug(`[Camera ${this.accessory.displayName}] ffmpeg closed with code ${code}`);
+        this.log.debug('[Camera ' + this.accessory.displayName + '] ffmpeg closed with code ${code}');
       });
       
     } else if (request.type === StreamRequestTypes.STOP) {
@@ -181,7 +181,7 @@ class SFRHomeCamera {
         } catch (e) {}
       }
       this.pendingSessions.delete(request.sessionID);
-      this.log.info(`[Camera ${this.accessory.displayName}] Stopping stream`);
+      this.log.info('[Camera ' + this.accessory.displayName + '] Stopping stream');
     }
   }
   
