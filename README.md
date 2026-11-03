@@ -18,13 +18,14 @@ Plugin Homebridge exposant les équipements **SFR HOME** à HomeKit via l'API SF
 - Pilotage de l'alarme (Désactivé / Maison / Nuit / Absent)
 - Support des volets/stores en tant que `WindowCovering`
 - Support des lumières ON/OFF amélioré
-- Support basique des caméras WiFi (avec capteur de mouvement)
-- Extraction de l'URL de flux caméra (`/homescope/flv`)
+- Support complet des caméras WiFi avec streaming en direct dans HomeKit
+- Snapshot via `/homescope/snapshot`
+- Flux vidéo via `/homescope/flv` avec transcodage ffmpeg
+- Capteur de mouvement
 
 ## À venir
 
 - Amélioration du pilotage des lumières (dimming/couleur)
-- Support complet du streaming caméra dans HomeKit
 - Création d'une version alternative sans abonnement ?
 
 ## Installation
