@@ -10,6 +10,7 @@ const fs = require("fs");
 const axios = require("axios");
 const xml2js = require("xml2js");
 const SFRAuth = require("./auth");
+const ip = require("ip");
 
 const PLUGIN_NAME = "SFR Home pour Homebridge";
 const PLATFORM_NAME = "SFRHomePlatform";
@@ -710,14 +711,24 @@ class SFRHomePlatform {
         break;
 
       case "CAMERA_WIFI": {
-        accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
-        // Add motion sensor for detection if available
-        accessory.addService(Service.MotionSensor, accessory.displayName + " (Motion)");
-        // Store camera info for potential streaming
+        // Store camera info for streaming
         const mac = d.deviceMac || d.mac || "";
         if (mac) {
           accessory.context.cameraMac = mac;
           accessory.context.streamUrl = `https://home.sfr.fr/homescope/flv?localconn=0&mac=${mac}`;
+        }
+        // Setup camera streaming if not already done
+        if (!accessory.context.sfrCamera) {
+          try {
+            accessory.context.sfrCamera = new SFRHomeCamera(this, accessory);
+          } catch (e) {
+            this.log.warn(`[SFR Home] Erreur initialisation caméra ${d.name}: ${e.message}`);
+            accessory.addService(Service.CameraRTPStreamManagement, accessory.displayName);
+          }
+        }
+        // Add motion sensor for detection if available
+        if (!accessory.getService(Service.MotionSensor)) {
+          accessory.addService(Service.MotionSensor, accessory.displayName + " (Motion)");
         }
         break;
       }
@@ -971,3 +982,5 @@ class SFRHomePlatform {
     }
   }
 }
+
+const SFRHomeCamera = require('./camera');
