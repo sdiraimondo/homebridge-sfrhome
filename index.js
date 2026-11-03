@@ -799,18 +799,28 @@ class SFRHomePlatform {
           svc.getCharacteristic(Characteristic.On)
             .on("set", async (value, callback) => {
               try {
-                // Try bulb control endpoint
                 const action = value ? "on" : "off";
-                await this._plugAction(d.id, action).catch(async () => {
-                  // Fallback to bulb action
-                  const url = `https://home.sfr.fr/bulbcontrol?uid=${encodeURIComponent(d.id)}&action=${action}`;
-                  if (this.auth && typeof this.auth.makeRequest === "function") {
-                    await this.auth.makeRequest(url, {
-                      headers: { Referer: "https://home.sfr.fr/accueil", "X-Requested-With": "XMLHttpRequest" },
-                      validateStatus: () => true
-                    });
-                  }
-                });
+                let success = false;
+                // Try different endpoints
+                const endpoints = [
+                  `https://home.sfr.fr/bulbcontrol?uid=${encodeURIComponent(d.id)}&action=${action}`,
+                  `https://home.sfr.fr/plugcontrol?uid=${encodeURIComponent(d.id)}&action=${action}`,
+                  `https://home.sfr.fr/ledcontrol?uid=${encodeURIComponent(d.id)}&action=${action}`
+                ];
+                for (const url of endpoints) {
+                  try {
+                    if (this.auth && typeof this.auth.makeRequest === "function") {
+                      const resp = await this.auth.makeRequest(url, {
+                        headers: { Referer: "https://home.sfr.fr/accueil", "X-Requested-With": "XMLHttpRequest" },
+                        validateStatus: () => true
+                      });
+                      if (resp.status < 400) { success = true; break; }
+                    }
+                  } catch (e) {}
+                }
+                if (!success) {
+                  try { await this._plugAction(d.id, action); success = true; } catch (e) {}
+                }
                 this.log.info(`[SFR Home] ${d.name} (light) -> ${value ? "ON" : "OFF"}`);
                 callback();
               } catch (e) {
