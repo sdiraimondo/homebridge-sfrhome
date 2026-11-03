@@ -22,7 +22,6 @@ Plugin Homebridge exposant les équipements **SFR HOME** à HomeKit via l'API SF
 ## À venir
 
 - Amélioration du pilotage des lumières (dimming/couleur)
-- Amélioration du pilotage des volets
 - Flux caméra
 - Création d'une version alternative sans abonnement ?
 
